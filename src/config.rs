@@ -11,6 +11,7 @@ pub struct TimeAppletConfig {
     pub show_date_in_top_panel: bool,
     pub show_weekday: bool,
     pub additional_clocks: Vec<String>,
+    pub show_persian_calendar: bool,
 }
 
 impl Default for TimeAppletConfig {
@@ -22,6 +23,7 @@ impl Default for TimeAppletConfig {
             show_date_in_top_panel: true,
             show_weekday: false,
             additional_clocks: Vec::new(),
+            show_persian_calendar: false,
         }
     }
 }

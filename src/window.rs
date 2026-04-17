@@ -17,7 +17,7 @@ use cosmic::{
     surface, theme,
     widget::{
         Button, Grid, Id, autosize, button, combo_box, container, divider, dropdown, grid, icon,
-        rectangle_tracker::*, space, text, toggler,
+        rectangle_tracker::*, segmented_button, space, tab_bar, text, toggler,
     },
 };
 use cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
@@ -32,11 +32,17 @@ use std::sync::LazyLock;
 use timedate_zbus::TimeDateProxy;
 use tokio::{sync::watch, time};
 
-use crate::{cities::{CityEntry, CITIES}, config::TimeAppletConfig, fl, time::get_calendar_first};
+use crate::{
+    cities::{CITIES, CityEntry},
+    config::TimeAppletConfig,
+    fl,
+    time::get_calendar_first,
+};
 use cosmic::applet::token::subscription::{
     TokenRequest, TokenUpdate, activation_token_subscription,
 };
 use icu::{
+    calendar::cal::Persian,
     datetime::{
         DateTimeFormatter, DateTimeFormatterPreferences, fieldsets,
         input::{Date as IcuDate, DateTime, Time},
@@ -69,10 +75,17 @@ pub enum Page {
     Settings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
     Clocks,
+    Calendar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarSystem {
+    Gregorian,
+    Persian,
 }
 
 fn get_system_locale() -> Locale {
@@ -122,7 +135,8 @@ pub struct Window {
     show_seconds_tx: watch::Sender<bool>,
     locale: Locale,
     page: Page,
-    settings_tab: SettingsTab,
+    tabs: segmented_button::SingleSelectModel,
+    active_calendar: CalendarSystem,
     city_combo_state: combo_box::State<CityEntry>,
 }
 
@@ -146,10 +160,14 @@ pub enum Message {
     SetShowDate(bool),
     SetShowWeekday(bool),
     SetFirstDayOfWeek(usize),
+    // Tab navigation
+    TabActivated(segmented_button::Entity),
     // Clocks settings
-    SetSettingsTab(SettingsTab),
     SelectCity(CityEntry),
     RemoveClock(usize),
+    // Calendar settings
+    SetShowPersianCalendar(bool),
+    SetActiveCalendar(CalendarSystem),
 }
 
 impl Window {
@@ -380,13 +398,7 @@ impl Window {
         let datetime = self.create_datetime(&self.date_selected);
         let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
 
-        let date = text(
-            DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
-                .unwrap()
-                .format(&datetime)
-                .to_string(),
-        )
-        .size(18);
+        let date = text(self.format_header_date(&self.date_selected)).size(18);
         let day_of_week = text::body(
             DateTimeFormatter::try_new(prefs, fieldsets::E::long())
                 .unwrap()
@@ -417,12 +429,46 @@ impl Window {
         .align_y(Alignment::Center)
         .padding([12, 20]);
 
-        let mut content = column![header, self.calendar_grid().padding([0, 12].into())];
+        let mut content = column![header];
+
+        if self.config.show_persian_calendar {
+            let cal_switcher = row![
+                button::custom(
+                    text::caption("Gregorian")
+                        .apply(container)
+                        .center(Length::Fill),
+                )
+                .width(Length::FillPortion(1))
+                .class(if self.active_calendar == CalendarSystem::Gregorian {
+                    button::ButtonClass::Suggested
+                } else {
+                    button::ButtonClass::Standard
+                })
+                .on_press(Message::SetActiveCalendar(CalendarSystem::Gregorian)),
+                button::custom(
+                    text::caption("Shamsi")
+                        .apply(container)
+                        .center(Length::Fill),
+                )
+                .width(Length::FillPortion(1))
+                .class(if self.active_calendar == CalendarSystem::Persian {
+                    button::ButtonClass::Suggested
+                } else {
+                    button::ButtonClass::Standard
+                })
+                .on_press(Message::SetActiveCalendar(CalendarSystem::Persian)),
+            ]
+            .spacing(space_s)
+            .padding([0, 20, space_s, 20]);
+
+            content = content.push(cal_switcher);
+        }
+
+        content = content.push(self.calendar_grid().padding([0, 12].into()));
 
         if !self.config.additional_clocks.is_empty() {
-            content = content.push(
-                padded_control(divider::horizontal::default()).padding([space_xxs, space_s]),
-            );
+            content = content
+                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
             for tz_name in &self.config.additional_clocks {
                 if let Ok(tz) = TimeZone::get(tz_name) {
                     let zoned = self.now.clone().with_time_zone(tz);
@@ -457,53 +503,30 @@ impl Window {
         .spacing(space_s)
         .padding([4, 8]);
 
-        let tab_general = button::custom(
-            text::body("General")
-                .apply(container)
-                .center(Length::Fill),
-        )
-        .width(Length::FillPortion(1))
-        .class(if self.settings_tab == SettingsTab::General {
-            button::ButtonClass::Suggested
-        } else {
-            button::ButtonClass::Standard
-        })
-        .on_press(Message::SetSettingsTab(SettingsTab::General));
-
-        let tab_clocks = button::custom(
-            text::body("Clocks")
-                .apply(container)
-                .center(Length::Fill),
-        )
-        .width(Length::FillPortion(1))
-        .class(if self.settings_tab == SettingsTab::Clocks {
-            button::ButtonClass::Suggested
-        } else {
-            button::ButtonClass::Standard
-        })
-        .on_press(Message::SetSettingsTab(SettingsTab::Clocks));
-
-        let tabs = row![tab_general, tab_clocks]
-            .spacing(space_s)
+        let tabs = tab_bar::horizontal(&self.tabs)
+            .on_activate(Message::TabActivated)
+            .button_height(32)
             .padding([space_s, space_m]);
 
-        let tab_content: Element<'_, Message> = match self.settings_tab {
+        let active_tab = self
+            .tabs
+            .active_data::<SettingsTab>()
+            .copied()
+            .unwrap_or(SettingsTab::General);
+
+        let tab_content: Element<'_, Message> = match active_tab {
             SettingsTab::General => scrollable(self.general_settings())
                 .height(Length::Fixed(SETTINGS_SCROLL_HEIGHT))
                 .into(),
             // Clocks manages its own layout: combo box sits above a smaller scrollable
             // list so the dropdown overlay is never clipped by a scrollable.
             SettingsTab::Clocks => self.clocks_settings(),
+            SettingsTab::Calendar => scrollable(self.calendar_settings())
+                .height(Length::Fixed(SETTINGS_SCROLL_HEIGHT))
+                .into(),
         };
 
-        column![
-            header,
-            divider::horizontal::default(),
-            tabs,
-            divider::horizontal::default(),
-            tab_content,
-        ]
-        .into()
+        column![header, tabs, divider::horizontal::default(), tab_content,].into()
     }
 
     fn general_settings(&self) -> Element<'_, Message> {
@@ -572,7 +595,9 @@ impl Window {
     }
 
     fn clocks_settings(&self) -> Element<'_, Message> {
-        let Spacing { space_s, space_m, .. } = theme::active().cosmic().spacing;
+        let Spacing {
+            space_s, space_m, ..
+        } = theme::active().cosmic().spacing;
 
         // Combo box for city search — kept outside the scrollable list so its
         // dropdown overlay is never clipped.
@@ -593,10 +618,8 @@ impl Window {
         // Scrollable list of already-added clocks.
         let mut clocks_list = column![];
         if self.config.additional_clocks.is_empty() {
-            clocks_list = clocks_list.push(
-                container(text::caption("No clocks added yet"))
-                    .padding([space_s, space_m]),
-            );
+            clocks_list = clocks_list
+                .push(container(text::caption("No clocks added yet")).padding([space_s, space_m]));
         }
         for (i, tz_name) in self.config.additional_clocks.iter().enumerate() {
             clocks_list = clocks_list.push(padded_control(
@@ -622,6 +645,63 @@ impl Window {
             scrollable(clocks_list).height(Length::Fixed(LIST_HEIGHT)),
         ]
         .into()
+    }
+
+    fn calendar_settings(&self) -> Element<'_, Message> {
+        let Spacing { space_s, space_m, .. } = theme::active().cosmic().spacing;
+
+        let persian_row = padded_control(
+            row![
+                column![
+                    text::body("Persian (Shamsi)"),
+                    text::caption("Solar Hijri / Jalali calendar"),
+                ]
+                .width(Length::Fill),
+                toggler(self.config.show_persian_calendar)
+                    .on_toggle(Message::SetShowPersianCalendar),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        column![
+            container(text::caption("ADDITIONAL CALENDARS")).padding([space_s, space_m]),
+            persian_row,
+        ]
+        .into()
+    }
+
+    fn format_header_date(&self, date: &jiff::civil::Date) -> String {
+        let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
+        let gregorian = IcuDate::try_new_gregorian(
+            date.year() as i32,
+            date.month() as u8,
+            date.day() as u8,
+        )
+        .unwrap();
+
+        match self.active_calendar {
+            CalendarSystem::Gregorian => {
+                let dt = DateTime {
+                    date: gregorian,
+                    time: Time::try_new(0, 0, 0, 0).unwrap(),
+                };
+                DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
+                    .unwrap()
+                    .format(&dt)
+                    .to_string()
+            }
+            CalendarSystem::Persian => {
+                let persian = gregorian.to_calendar(Persian);
+                let dt = DateTime {
+                    date: persian,
+                    time: Time::try_new(0, 0, 0, 0).unwrap(),
+                };
+                DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
+                    .unwrap()
+                    .format(&dt)
+                    .to_string()
+            }
+        }
     }
 }
 
@@ -653,7 +733,12 @@ impl cosmic::Application for Window {
                 show_seconds_tx,
                 locale,
                 page: Page::Calendar,
-                settings_tab: SettingsTab::General,
+                tabs: segmented_button::Model::builder()
+                    .insert(|b| b.text("General").data(SettingsTab::General).activate())
+                    .insert(|b| b.text("Clocks").data(SettingsTab::Clocks))
+                    .insert(|b| b.text("Calendar").data(SettingsTab::Calendar))
+                    .build(),
+                active_calendar: CalendarSystem::Gregorian,
                 city_combo_state: combo_box::State::new(CITIES.clone()),
             },
             Task::none(),
@@ -742,9 +827,12 @@ impl cosmic::Application for Window {
             let mut stream_tz = proxy.receive_timezone_changed().await;
             while let Some(property) = stream_tz.next().await {
                 let tz = property.get().await?;
-                output.send(Message::TimezoneUpdate(tz)).await.map_err(|e| {
-                    zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(e)))
-                })?;
+                output
+                    .send(Message::TimezoneUpdate(tz))
+                    .await
+                    .map_err(|e| {
+                        zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(e)))
+                    })?;
             }
             Ok(())
         }
@@ -827,7 +915,12 @@ impl cosmic::Application for Window {
                         None,
                         None,
                     );
-                    let Rectangle { x, y, width, height } = self.rectangle;
+                    let Rectangle {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } = self.rectangle;
                     popup_settings.positioner.anchor_rect = Rectangle::<i32> {
                         x: x.max(1.) as i32,
                         y: y.max(1.) as i32,
@@ -839,10 +932,10 @@ impl cosmic::Application for Window {
                 }
             }
             Message::Tick => {
-                self.now = self.timezone.as_ref().map_or_else(
-                    Zoned::now,
-                    |tz| Zoned::now().with_time_zone(tz.clone()),
-                );
+                self.now = self
+                    .timezone
+                    .as_ref()
+                    .map_or_else(Zoned::now, |tz| Zoned::now().with_time_zone(tz.clone()));
                 Task::none()
             }
             Message::Rectangle(u) => {
@@ -949,8 +1042,8 @@ impl cosmic::Application for Window {
                 self.save_config();
                 Task::none()
             }
-            Message::SetSettingsTab(tab) => {
-                self.settings_tab = tab;
+            Message::TabActivated(entity) => {
+                self.tabs.activate(entity);
                 Task::none()
             }
             Message::SelectCity(entry) => {
@@ -967,6 +1060,18 @@ impl cosmic::Application for Window {
                     self.config.additional_clocks.remove(i);
                     self.save_config();
                 }
+                Task::none()
+            }
+            Message::SetShowPersianCalendar(v) => {
+                self.config.show_persian_calendar = v;
+                if !v && self.active_calendar == CalendarSystem::Persian {
+                    self.active_calendar = CalendarSystem::Gregorian;
+                }
+                self.save_config();
+                Task::none()
+            }
+            Message::SetActiveCalendar(cal) => {
+                self.active_calendar = cal;
                 Task::none()
             }
         }
@@ -1039,4 +1144,3 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
         button
     }
 }
-
