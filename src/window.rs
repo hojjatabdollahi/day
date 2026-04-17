@@ -16,8 +16,8 @@ use cosmic::{
     },
     surface, theme,
     widget::{
-        Button, Grid, Id, autosize, button, container, divider, dropdown, grid, icon,
-        rectangle_tracker::*, space, text, text_input, toggler,
+        Button, Grid, Id, autosize, button, combo_box, container, divider, dropdown, grid, icon,
+        rectangle_tracker::*, space, text, toggler,
     },
 };
 use cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 use timedate_zbus::TimeDateProxy;
 use tokio::{sync::watch, time};
 
-use crate::{config::TimeAppletConfig, fl, time::get_calendar_first};
+use crate::{cities::{CityEntry, CITIES}, config::TimeAppletConfig, fl, time::get_calendar_first};
 use cosmic::applet::token::subscription::{
     TokenRequest, TokenUpdate, activation_token_subscription,
 };
@@ -123,8 +123,7 @@ pub struct Window {
     locale: Locale,
     page: Page,
     settings_tab: SettingsTab,
-    clock_input: String,
-    clock_input_error: bool,
+    city_combo_state: combo_box::State<CityEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,8 +148,7 @@ pub enum Message {
     SetFirstDayOfWeek(usize),
     // Clocks settings
     SetSettingsTab(SettingsTab),
-    SetClockInput(String),
-    AddClock,
+    SelectCity(CityEntry),
     RemoveClock(usize),
 }
 
@@ -489,8 +487,12 @@ impl Window {
             .spacing(space_s)
             .padding([space_s, space_m]);
 
-        let tab_content = match self.settings_tab {
-            SettingsTab::General => self.general_settings(),
+        let tab_content: Element<'_, Message> = match self.settings_tab {
+            SettingsTab::General => scrollable(self.general_settings())
+                .height(Length::Fixed(SETTINGS_SCROLL_HEIGHT))
+                .into(),
+            // Clocks manages its own layout: combo box sits above a smaller scrollable
+            // list so the dropdown overlay is never clipped by a scrollable.
             SettingsTab::Clocks => self.clocks_settings(),
         };
 
@@ -499,7 +501,7 @@ impl Window {
             divider::horizontal::default(),
             tabs,
             divider::horizontal::default(),
-            scrollable(tab_content).height(Length::Fixed(SETTINGS_SCROLL_HEIGHT)),
+            tab_content,
         ]
         .into()
     }
@@ -570,33 +572,40 @@ impl Window {
     }
 
     fn clocks_settings(&self) -> Element<'_, Message> {
-        let Spacing { space_s, .. } = theme::active().cosmic().spacing;
+        let Spacing { space_s, space_m, .. } = theme::active().cosmic().spacing;
 
-        let mut add_col = column![
-            text::body("Add timezone"),
-            row![
-                text_input("e.g. America/New_York", &self.clock_input)
-                    .on_input(Message::SetClockInput)
-                    .on_submit(|_| Message::AddClock)
-                    .width(Length::Fill),
-                button::icon(icon::from_name("list-add-symbolic"))
-                    .padding(8)
-                    .on_press(Message::AddClock),
+        // Combo box for city search — kept outside the scrollable list so its
+        // dropdown overlay is never clipped.
+        let search = padded_control(
+            column![
+                text::body("Search for a city"),
+                combo_box::ComboBox::new(
+                    &self.city_combo_state,
+                    "e.g. Tokyo, London, New York…",
+                    None::<&CityEntry>,
+                    Message::SelectCity,
+                )
+                .width(Length::Fill),
             ]
-            .spacing(space_s)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(space_s);
-        if self.clock_input_error {
-            add_col = add_col.push(text::caption("Invalid timezone name"));
-        }
-        let add_row = padded_control(add_col);
+            .spacing(space_s),
+        );
 
+        // Scrollable list of already-added clocks.
         let mut clocks_list = column![];
+        if self.config.additional_clocks.is_empty() {
+            clocks_list = clocks_list.push(
+                container(text::caption("No clocks added yet"))
+                    .padding([space_s, space_m]),
+            );
+        }
         for (i, tz_name) in self.config.additional_clocks.iter().enumerate() {
             clocks_list = clocks_list.push(padded_control(
                 row![
-                    text::body(clock_display_name(tz_name)).width(Length::Fill),
+                    column![
+                        text::body(clock_display_name(tz_name)),
+                        text::caption(tz_name),
+                    ]
+                    .width(Length::Fill),
                     button::icon(icon::from_name("list-remove-symbolic"))
                         .padding(4)
                         .on_press(Message::RemoveClock(i)),
@@ -605,7 +614,14 @@ impl Window {
             ));
         }
 
-        column![add_row, clocks_list].into()
+        const LIST_HEIGHT: f32 = SETTINGS_SCROLL_HEIGHT - 90.0;
+
+        column![
+            search,
+            divider::horizontal::default(),
+            scrollable(clocks_list).height(Length::Fixed(LIST_HEIGHT)),
+        ]
+        .into()
     }
 }
 
@@ -638,8 +654,7 @@ impl cosmic::Application for Window {
                 locale,
                 page: Page::Calendar,
                 settings_tab: SettingsTab::General,
-                clock_input: String::new(),
-                clock_input_error: false,
+                city_combo_state: combo_box::State::new(CITIES.clone()),
             },
             Task::none(),
         )
@@ -938,26 +953,13 @@ impl cosmic::Application for Window {
                 self.settings_tab = tab;
                 Task::none()
             }
-            Message::SetClockInput(s) => {
-                self.clock_input = s;
-                self.clock_input_error = false;
-                Task::none()
-            }
-            Message::AddClock => {
-                let input = self.clock_input.trim().to_string();
-                if input.is_empty() {
-                    return Task::none();
-                }
-                if TimeZone::get(&input).is_err() {
-                    self.clock_input_error = true;
-                    return Task::none();
-                }
-                if !self.config.additional_clocks.contains(&input) {
-                    self.config.additional_clocks.push(input);
+            Message::SelectCity(entry) => {
+                if !self.config.additional_clocks.contains(&entry.timezone) {
+                    self.config.additional_clocks.push(entry.timezone);
                     self.save_config();
                 }
-                self.clock_input.clear();
-                self.clock_input_error = false;
+                // Recreate state to clear the search text
+                self.city_combo_state = combo_box::State::new(CITIES.clone());
                 Task::none()
             }
             Message::RemoveClock(i) => {

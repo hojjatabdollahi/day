@@ -901,6 +901,7 @@ dependencies = [
  "logind-zbus",
  "rust-embed",
  "serde",
+ "serde_json",
  "timedate-zbus",
  "tokio",
  "tracing",

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+pub mod cities;
 pub mod config;
 
 mod localize;
