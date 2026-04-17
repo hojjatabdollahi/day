@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+use cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
+
+#[derive(Debug, Clone, CosmicConfigEntry, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[version = 1]
+pub struct TimeAppletConfig {
+    pub military_time: bool,
+    pub show_seconds: bool,
+    pub first_day_of_week: u8,
+    pub show_date_in_top_panel: bool,
+    pub show_weekday: bool,
+    pub additional_clocks: Vec<String>,
+}
+
+impl Default for TimeAppletConfig {
+    fn default() -> Self {
+        Self {
+            military_time: false,
+            show_seconds: false,
+            first_day_of_week: 6,
+            show_date_in_top_panel: true,
+            show_weekday: false,
+            additional_clocks: Vec::new(),
+        }
+    }
+}

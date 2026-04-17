@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hojjatabdollahi.day</id>
+  <name>Date, Time &amp; Calendar</name>
+  <summary>Display the current time in the panel with a calendar popup</summary>
+  <developer_name>Hojjat</developer_name>
+  <update_contact>hojjat@example.com</update_contact>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <provides>
+    <binary>cosmic-applet-time</binary>
+  </provides>
+  <releases>
+    <release version="1.0.2" date="2026-04-17"/>
+  </releases>
+</component>
