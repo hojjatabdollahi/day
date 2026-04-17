@@ -8,16 +8,17 @@ use cosmic::{
     iced::stream,
     iced::widget::Column,
     iced::{
-        Alignment, Length, Rectangle, Subscription,
+        Alignment, Color, Length, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
-        platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
+        mouse::ScrollDelta,
+        platform_specific::shell::wayland::commands::popup::destroy_popup,
         widget::{column, row, rule, scrollable},
         window,
     },
-    surface, theme,
+    theme,
     widget::{
-        Button, Grid, Id, autosize, button, container, divider, dropdown, grid, icon,
-        rectangle_tracker::*, space, text, text_input, toggler,
+        Button, Grid, Id, autosize, button, combo_box, container, divider, dropdown, grid, icon,
+        mouse_area, rectangle_tracker::*, segmented_button, space, tab_bar, text, toggler,
     },
 };
 use cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
@@ -29,50 +30,62 @@ use jiff::{
 use logind_zbus::manager::ManagerProxy;
 use std::hash::Hash;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use timedate_zbus::TimeDateProxy;
 use tokio::{sync::watch, time};
 
-use crate::{config::TimeAppletConfig, fl, time::get_calendar_first};
+use crate::{
+    cities::{CITIES, CityEntry},
+    config::TimeAppletConfig,
+    time::get_calendar_first,
+};
 use cosmic::applet::token::subscription::{
     TokenRequest, TokenUpdate, activation_token_subscription,
 };
 use icu::{
+    calendar::{Gregorian, cal::Persian},
     datetime::{
         DateTimeFormatter, DateTimeFormatterPreferences, fieldsets,
         input::{Date as IcuDate, DateTime, Time},
         options::TimePrecision,
     },
-    locale::{Locale, preferences::extensions::unicode::keywords::HourCycle},
+    locale::{
+        Locale, locale,
+        preferences::extensions::unicode::keywords::{CalendarAlgorithm, HourCycle},
+    },
 };
 
 const APPLET_ID: &str = "io.github.hojjatabdollahi.day";
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 
-static FIRST_DAY_OPTIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    vec![
-        "Monday".into(),
-        "Tuesday".into(),
-        "Wednesday".into(),
-        "Thursday".into(),
-        "Friday".into(),
-        "Saturday".into(),
-        "Sunday".into(),
-    ]
-});
+const FIRST_DAY_OPTIONS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
 
 const SETTINGS_SCROLL_HEIGHT: f32 = 380.0;
+
+const STOPWATCH_LAPS_HEIGHT: f32 = 180.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
     Calendar,
     Settings,
+    Stopwatch,
+    Timer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
     Clocks,
+    Calendar,
 }
 
 fn get_system_locale() -> Locale {
@@ -88,24 +101,130 @@ fn get_system_locale() -> Locale {
                 return locale;
             }
 
-            if let Some(lang) = cleaned_locale.split('-').next() {
-                if let Ok(locale) = Locale::try_from_str(lang) {
-                    return locale;
-                }
+            if let Some(lang) = cleaned_locale.split('-').next()
+                && let Ok(locale) = Locale::try_from_str(lang)
+            {
+                return locale;
             }
         }
     }
-    tracing::warn!("No valid locale found in environment, using fallback");
-    Locale::try_from_str("en-US").expect("Failed to parse fallback locale 'en-US'")
+    tracing::warn!("No valid locale found in environment, using en-US");
+    locale!("en-US")
 }
 
 /// Turns "America/New_York" into "New York", "UTC" into "UTC", etc.
 fn clock_display_name(tz_name: &str) -> String {
     tz_name
-        .split('/')
-        .last()
+        .rsplit('/')
+        .next()
         .unwrap_or(tz_name)
         .replace('_', " ")
+}
+
+/// Offset from local time as "+9", "+9:30" or "-7".
+fn format_offset(secs: i32) -> String {
+    let sign = if secs < 0 { "-" } else { "+" };
+    let (hours, mins) = (secs.abs() / 3600, secs.abs() / 60 % 60);
+    if mins == 0 {
+        format!("{sign}{hours}")
+    } else {
+        format!("{sign}{hours}:{mins:02}")
+    }
+}
+
+/// Pomodoro presets: one click sets the duration and starts the timer.
+fn timer_presets() -> Element<'static, Message> {
+    let preset = |label: &'static str, mins: u64| {
+        button::standard(label).on_press(Message::TimerPreset(mins * 60))
+    };
+    column![
+        text::caption("Pomodoro"),
+        row![
+            preset("Focus 25", 25),
+            preset("Break 5", 5),
+            preset("Rest 15", 15)
+        ]
+        .spacing(8),
+    ]
+    .align_x(Alignment::Center)
+    .spacing(4)
+    .apply(container)
+    .center_x(Length::Fill)
+    .into()
+}
+
+fn icu_date(date: Date) -> IcuDate<Gregorian> {
+    IcuDate::try_new_gregorian(i32::from(date.year()), date.month() as u8, date.day() as u8)
+        .expect("valid date")
+}
+
+fn icu_datetime(zoned: &Zoned) -> DateTime<Gregorian> {
+    DateTime {
+        date: icu_date(zoned.date()),
+        time: Time::try_new(
+            zoned.hour() as u8,
+            zoned.minute() as u8,
+            zoned.second() as u8,
+            0,
+        )
+        .expect("valid time"),
+    }
+}
+
+fn format_shamsi_date(date: Date) -> String {
+    let mut prefs = DateTimeFormatterPreferences::from(locale!("fa"));
+    prefs.calendar_algorithm = Some(CalendarAlgorithm::Persian);
+    DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
+        .unwrap()
+        .format(&icu_date(date).to_calendar(Persian))
+        .to_string()
+}
+
+/// Overlay menus share the popup's surface. With frosted glass on, libcosmic
+/// gives them the same translucent background as the popup, so they'd draw
+/// translucent-over-translucent and look see-through. Render them opaque.
+fn opaque<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let theme = theme::Theme {
+        transparent: false,
+        ..theme::active()
+    };
+    cosmic::iced::widget::Themer::new(Some(theme), content).into()
+}
+
+fn toggle_row(
+    label: &'static str,
+    on: bool,
+    msg: fn(bool) -> Message,
+) -> Element<'static, Message> {
+    padded_control(
+        row![
+            text::body(label).width(Length::Fill),
+            toggler(on).on_toggle(msg),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .into()
+}
+
+/// Subscription key for a `watch` receiver. Hashes only the id, so the stream
+/// is not restarted when `subscription()` hands over a fresh receiver.
+struct Watch<T> {
+    inner: watch::Receiver<T>,
+    id: &'static str,
+}
+
+impl<T> Hash for Watch<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timer {
+    Idle,
+    Running { deadline: Instant },
+    Paused { remaining: Duration },
+    Finished { at: Instant },
 }
 
 pub struct Window {
@@ -122,9 +241,61 @@ pub struct Window {
     show_seconds_tx: watch::Sender<bool>,
     locale: Locale,
     page: Page,
-    settings_tab: SettingsTab,
-    clock_input: String,
-    clock_input_error: bool,
+    tabs: segmented_button::SingleSelectModel,
+    city_combo_state: combo_box::State<CityEntry>,
+    // Stopwatch: elapsed = accumulated + time since running_since.
+    running_since: Option<Instant>,
+    accumulated: Duration,
+    laps: Vec<Duration>,
+    timer_duration: Duration,
+    timer: Timer,
+    // Step being repeated while a timer arrow is held.
+    hold_tx: watch::Sender<Option<i64>>,
+    // Repaint period for the stopwatch/timer; None while neither is counting.
+    tick_tx: watch::Sender<Option<Duration>>,
+}
+
+/// "01:23.45" or "1:02:03.45"
+fn format_elapsed(d: Duration) -> String {
+    format!("{}.{:02}", format_elapsed_short(d), d.subsec_millis() / 10)
+}
+
+/// "01:23" or "1:02:03"
+fn format_elapsed_short(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
+}
+
+async fn send_notification(summary: String, body: String) -> zbus::Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let actions: Vec<&str> = Vec::new();
+    let hints: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> =
+        std::collections::HashMap::new();
+    conn.call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &(
+            "Day",            // app_name
+            0u32,             // replaces_id
+            "alarm-symbolic", // app_icon
+            summary,          // summary
+            body,             // body
+            actions,          // actions
+            hints,            // hints
+            -1i32,            // expire_timeout (default)
+        ),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -136,72 +307,54 @@ pub enum Message {
     SelectDay(i8),
     PreviousMonth,
     NextMonth,
+    GoToToday,
     ToggleSettings,
     Token(TokenUpdate),
     ConfigChanged(TimeAppletConfig),
     TimezoneUpdate(String),
-    Surface(surface::Action),
     // General settings
     SetMilitaryTime(bool),
     SetShowSeconds(bool),
     SetShowDate(bool),
     SetShowWeekday(bool),
     SetFirstDayOfWeek(usize),
+    // Tab navigation
+    TabActivated(segmented_button::Entity),
     // Clocks settings
-    SetSettingsTab(SettingsTab),
-    SetClockInput(String),
-    AddClock,
+    SelectCity(CityEntry),
     RemoveClock(usize),
+    // Calendar settings
+    SetShowPersianCalendar(bool),
+    // Stopwatch
+    ToggleStopwatch,
+    StopwatchStartPause,
+    StopwatchReset,
+    StopwatchLap,
+    // Timer
+    ToggleTimer,
+    TimerStartPause,
+    TimerReset,
+    TimerDismiss,
+    TimerAdd(i64),
+    TimerPreset(u64),
+    TimerHoldStart(i64),
+    TimerHoldStop,
+    TimerHoldTick,
+    // Shared repaint tick for the stopwatch and timer
+    FastTick,
 }
 
 impl Window {
     fn save_config(&self) {
-        if let Ok(helper) = CosmicConfig::new(APPLET_ID, TimeAppletConfig::VERSION) {
-            if let Err(err) = self.config.write_entry(&helper) {
-                tracing::error!(?err, "Failed to save config");
-            }
-        }
-    }
-
-    fn create_datetime(&self, date: &Date) -> DateTime<icu::calendar::Gregorian> {
-        DateTime {
-            date: IcuDate::try_new_gregorian(
-                date.year() as i32,
-                date.month() as u8,
-                date.day() as u8,
-            )
-            .unwrap(),
-            time: Time::try_new(
-                self.now.hour() as u8,
-                self.now.minute() as u8,
-                self.now.second() as u8,
-                0,
-            )
-            .unwrap(),
-        }
-    }
-
-    fn create_datetime_for_zoned(&self, zoned: &Zoned) -> DateTime<icu::calendar::Gregorian> {
-        let date = zoned.date();
-        DateTime {
-            date: IcuDate::try_new_gregorian(
-                date.year() as i32,
-                date.month() as u8,
-                date.day() as u8,
-            )
-            .unwrap(),
-            time: Time::try_new(
-                zoned.hour() as u8,
-                zoned.minute() as u8,
-                zoned.second() as u8,
-                0,
-            )
-            .unwrap(),
+        if let Ok(helper) = CosmicConfig::new(APPLET_ID, TimeAppletConfig::VERSION)
+            && let Err(err) = self.config.write_entry(&helper)
+        {
+            tracing::error!(?err, "Failed to save config");
         }
     }
 
     fn format_clock_time(&self, zoned: &Zoned) -> String {
-        let dt = self.create_datetime_for_zoned(zoned);
+        let dt = icu_datetime(zoned);
         let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
         prefs.hour_cycle = Some(if self.config.military_time {
             HourCycle::H23
@@ -238,14 +391,15 @@ impl Window {
 
         for i in 0..7 {
             let date = first_day.checked_add(i.days()).unwrap();
-            let datetime = self.create_datetime(&date);
             calendar = calendar.push(
-                text::caption(weekday.format(&datetime).to_string())
+                text::caption(weekday.format(&icu_date(date)).to_string())
                     .apply(container)
                     .center_x(Length::Fixed(44.0)),
             );
         }
         calendar = calendar.insert_row();
+
+        let show_persian = self.config.show_persian_calendar;
 
         for i in 0..42 {
             if i > 0 && i % 7 == 0 {
@@ -259,16 +413,323 @@ impl Window {
             let is_day = date == self.date_selected;
             let is_today = date == self.date_today;
 
-            calendar = calendar.push(date_button(date.day(), is_month, is_day, is_today));
+            let persian_day = if show_persian {
+                Some(icu_date(date).to_calendar(Persian).day_of_month().0)
+            } else {
+                None
+            };
+
+            calendar = calendar.push(date_button(
+                date.day(),
+                is_month,
+                is_day,
+                is_today,
+                persian_day,
+            ));
         }
 
         calendar
     }
 
+    fn stopwatch_elapsed(&self) -> Duration {
+        self.accumulated + self.running_since.map_or(Duration::ZERO, |t| t.elapsed())
+    }
+
+    /// Repaint period: 100ms with a readout on screen, 1s for the panel, 500ms
+    /// blink once the timer has finished, None when nothing is counting.
+    fn desired_tick(&self) -> Option<Duration> {
+        let on_screen = self.popup.is_some() && matches!(self.page, Page::Stopwatch | Page::Timer);
+        let counting = self.running_since.is_some() || self.timer_running();
+        let mut ms = counting.then_some(if on_screen { 100 } else { 1000 });
+        if self.timer_finished() {
+            ms = Some(ms.map_or(500, |m| m.min(500)));
+        }
+        ms.map(Duration::from_millis)
+    }
+
+    fn timer_running(&self) -> bool {
+        matches!(self.timer, Timer::Running { .. })
+    }
+
+    fn timer_finished(&self) -> bool {
+        matches!(self.timer, Timer::Finished { .. })
+    }
+
+    /// Running or finished: the timer owns the panel and the page shown on open.
+    fn timer_active(&self) -> bool {
+        self.timer_running() || self.timer_finished()
+    }
+
+    /// Adjust the duration while idle, clamped to 0..=99h.
+    fn timer_add(&mut self, delta: i64) {
+        if self.timer == Timer::Idle {
+            let secs = (self.timer_duration.as_secs() as i64 + delta).clamp(0, 99 * 3600);
+            self.timer_duration = Duration::from_secs(secs as u64);
+        }
+    }
+
+    fn timer_remaining(&self) -> Duration {
+        match self.timer {
+            Timer::Idle => self.timer_duration,
+            Timer::Running { deadline } => deadline.saturating_duration_since(Instant::now()),
+            Timer::Paused { remaining } => remaining,
+            Timer::Finished { .. } => Duration::ZERO,
+        }
+    }
+
+    /// Red for the last 10 seconds; blinks red/transparent once finished.
+    fn timer_text_class(&self) -> theme::Text {
+        let red = Color::from(theme::active().cosmic().destructive.base);
+        match self.timer {
+            Timer::Finished { at } if at.elapsed().as_millis() / 500 % 2 == 1 => {
+                theme::Text::Color(Color::TRANSPARENT)
+            }
+            Timer::Finished { .. } => theme::Text::Color(red),
+            Timer::Running { .. } if self.timer_remaining() <= Duration::from_secs(10) => {
+                theme::Text::Color(red)
+            }
+            _ => theme::Text::Default,
+        }
+    }
+
+    /// Icon plus readout shown on the panel while the stopwatch or timer runs.
+    fn panel_indicator(
+        &self,
+        horizontal: bool,
+        icon_name: &'static str,
+        readout: String,
+        class: theme::Text,
+    ) -> Element<'_, Message> {
+        let (width, height) = self.core.applet.suggested_size(true);
+        let padding = 2 * self.core.applet.suggested_padding(true).1;
+        let label = self.core.applet.text(readout).class(class);
+        let glyph = icon::from_name(icon_name).size(width);
+        if horizontal {
+            row!(
+                glyph,
+                label,
+                container(space::vertical().height(Length::Fixed((height + padding) as f32)))
+            )
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            column!(
+                glyph,
+                label,
+                space::horizontal().width(Length::Fixed((width + padding) as f32))
+            )
+            .spacing(4)
+            .align_x(Alignment::Center)
+            .into()
+        }
+    }
+
+    fn timer_view(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_xxs,
+            space_s,
+            space_m,
+            ..
+        } = theme::active().cosmic().spacing;
+
+        let header = row![
+            button::icon(icon::from_name("go-previous-symbolic"))
+                .padding(8)
+                .on_press(Message::ToggleTimer),
+            text::heading("Timer"),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(space_s)
+        .padding([4, 8]);
+
+        let running = self.timer_running();
+        let finished = self.timer_finished();
+        let remaining = self.timer_remaining();
+
+        let readout = container(
+            text(format_elapsed_short(remaining))
+                .size(48)
+                .class(self.timer_text_class()),
+        )
+        .center_x(Length::Fill)
+        .padding([space_m, 0]);
+
+        let mut content = column![header].spacing(space_s);
+
+        if finished {
+            content = content.push(
+                container(text::heading("Time's up"))
+                    .center_x(Length::Fill)
+                    .padding([0, 0, space_s, 0]),
+            );
+        }
+
+        content = content.push(readout);
+
+        if self.timer == Timer::Idle {
+            content = content.push(self.timer_steppers());
+            content = content.push(timer_presets());
+        }
+
+        let controls: Element<'_, Message> = if finished {
+            row![button::suggested("Dismiss").on_press(Message::TimerDismiss),]
+                .spacing(space_s)
+                .padding([0, space_m])
+                .into()
+        } else {
+            let primary = {
+                let label = if running { "Pause" } else { "Start" };
+                let b = button::suggested(label);
+                if running || remaining > Duration::ZERO {
+                    b.on_press(Message::TimerStartPause)
+                } else {
+                    b
+                }
+            };
+            let reset = {
+                let b = button::standard("Reset");
+                if self.timer != Timer::Idle || self.timer_duration > Duration::ZERO {
+                    b.on_press(Message::TimerReset)
+                } else {
+                    b
+                }
+            };
+            row![reset, space::horizontal().width(Length::Fill), primary]
+                .spacing(space_s)
+                .padding([0, space_m])
+                .into()
+        };
+
+        content = content
+            .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+        content = content.push(controls);
+
+        content.padding([8, 0]).into()
+    }
+
+    /// Up/down steppers for hours, minutes and seconds.
+    fn timer_steppers(&self) -> Element<'_, Message> {
+        let total = self.timer_duration.as_secs();
+        let hours = total / 3600;
+        let mins = (total / 60) % 60;
+        let secs = total % 60;
+
+        let unit = |label: &'static str, value: u64, step: i64| -> Element<'_, Message> {
+            // on_press_down so a hold can repeat; release_listener ends it.
+            let col = column![
+                button::custom(icon::from_name("go-up-symbolic").size(16))
+                    .class(theme::Button::Icon)
+                    .padding(4)
+                    .on_press_down(Message::TimerHoldStart(step)),
+                text(format!("{value:02}")).size(28),
+                text::caption(label),
+                button::custom(icon::from_name("go-down-symbolic").size(16))
+                    .class(theme::Button::Icon)
+                    .padding(4)
+                    .on_press_down(Message::TimerHoldStart(-step)),
+            ]
+            .align_x(Alignment::Center)
+            .spacing(4);
+            mouse_area(col)
+                .on_scroll(move |delta| {
+                    let y = match delta {
+                        ScrollDelta::Lines { y, .. } | ScrollDelta::Pixels { y, .. } => y,
+                    };
+                    Message::TimerAdd(if y > 0.0 {
+                        step
+                    } else if y < 0.0 {
+                        -step
+                    } else {
+                        0
+                    })
+                })
+                .into()
+        };
+
+        row![
+            unit("hr", hours, 3600),
+            unit("min", mins, 60),
+            unit("sec", secs, 1),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center)
+        .apply(container)
+        .center_x(Length::Fill)
+        .into()
+    }
+
+    fn refresh_tick(&self) {
+        let _ = self.tick_tx.send(self.desired_tick());
+    }
+
+    fn stopwatch_view(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_xxs,
+            space_s,
+            space_m,
+            ..
+        } = theme::active().cosmic().spacing;
+
+        let running = self.running_since.is_some();
+        let elapsed = self.stopwatch_elapsed();
+
+        let header = row![
+            button::icon(icon::from_name("go-previous-symbolic"))
+                .padding(8)
+                .on_press(Message::ToggleStopwatch),
+            text::heading("Stopwatch"),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(space_s)
+        .padding([4, 8]);
+
+        let readout = container(text(format_elapsed(elapsed)).size(48))
+            .center_x(Length::Fill)
+            .padding([space_m, 0]);
+
+        let primary = button::suggested(if running { "Pause" } else { "Start" })
+            .on_press(Message::StopwatchStartPause);
+
+        let secondary = if running {
+            button::standard("Lap").on_press(Message::StopwatchLap)
+        } else {
+            let b = button::standard("Reset");
+            if elapsed > Duration::ZERO {
+                b.on_press(Message::StopwatchReset)
+            } else {
+                b
+            }
+        };
+
+        let controls = row![secondary, space::horizontal().width(Length::Fill), primary]
+            .spacing(space_s)
+            .padding([0, space_m]);
+
+        let mut content = column![header, readout, controls].spacing(space_s);
+
+        if !self.laps.is_empty() {
+            content = content
+                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+            let mut list = column![].spacing(space_xxs);
+            for (i, lap) in self.laps.iter().enumerate() {
+                list = list.push(
+                    row![
+                        text::body(format!("Lap {}", i + 1)).width(Length::Fill),
+                        text::body(format_elapsed(*lap)),
+                    ]
+                    .padding([4, space_m]),
+                );
+            }
+            content = content.push(scrollable(list).height(Length::Fixed(STOPWATCH_LAPS_HEIGHT)));
+        }
+
+        content.padding([8, 0]).into()
+    }
+
     fn vertical_layout(&self) -> Element<'_, Message> {
         let mut elements: Vec<Element<'_, Message>> = Vec::new();
-        let date = self.now.date();
-        let datetime = self.create_datetime(&date);
+        let datetime = icu_datetime(&self.now);
         let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
         prefs.hour_cycle = Some(if self.config.military_time {
             HourCycle::H23
@@ -322,7 +783,7 @@ impl Window {
     }
 
     fn horizontal_layout(&self) -> Element<'_, Message> {
-        let datetime = self.create_datetime(&self.now.date());
+        let datetime = icu_datetime(&self.now);
         let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
         prefs.hour_cycle = Some(if self.config.military_time {
             HourCycle::H23
@@ -379,20 +840,20 @@ impl Window {
             space_xxs, space_s, ..
         } = theme::active().cosmic().spacing;
 
-        let datetime = self.create_datetime(&self.date_selected);
+        let selected = icu_date(self.date_selected);
         let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
 
         let date = text(
             DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
                 .unwrap()
-                .format(&datetime)
+                .format(&selected)
                 .to_string(),
         )
         .size(18);
         let day_of_week = text::body(
             DateTimeFormatter::try_new(prefs, fieldsets::E::long())
                 .unwrap()
-                .format(&datetime)
+                .format(&selected)
                 .to_string(),
         );
 
@@ -406,35 +867,73 @@ impl Window {
         ]
         .spacing(8);
 
+        let stopwatch_btn = button::icon(icon::from_name("accessories-clock-symbolic"))
+            .padding(8)
+            .on_press(Message::ToggleStopwatch);
+
+        let timer_btn = button::icon(icon::from_name("alarm-symbolic"))
+            .padding(8)
+            .on_press(Message::ToggleTimer);
+
         let settings_btn = button::icon(icon::from_name("preferences-system-symbolic"))
             .padding(8)
             .on_press(Message::ToggleSettings);
 
-        let header = row![
-            column![date, day_of_week],
+        // Date gets its own row so long month names can't push the buttons off the popup.
+        let controls = row![
+            day_of_week,
             space::horizontal().width(Length::Fill),
             month_controls,
+            stopwatch_btn,
+            timer_btn,
             settings_btn,
         ]
-        .align_y(Alignment::Center)
-        .padding([12, 20]);
+        .align_y(Alignment::Center);
+
+        let mut date_row = row![date].align_y(Alignment::Center);
+        if self.date_selected != self.date_today {
+            date_row = date_row.push(space::horizontal().width(Length::Fill)).push(
+                button::icon(icon::from_name("x-office-calendar-symbolic"))
+                    .padding(4)
+                    .on_press(Message::GoToToday),
+            );
+        }
+
+        let mut header = column![date_row, controls];
+        if self.config.show_persian_calendar {
+            header = header.push(text::caption(format_shamsi_date(self.date_selected)));
+        }
+        let header = header.padding([12, 20]);
 
         let mut content = column![header, self.calendar_grid().padding([0, 12].into())];
 
         if !self.config.additional_clocks.is_empty() {
-            content = content.push(
-                padded_control(divider::horizontal::default()).padding([space_xxs, space_s]),
-            );
+            content = content
+                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
             for tz_name in &self.config.additional_clocks {
                 if let Ok(tz) = TimeZone::get(tz_name) {
                     let zoned = self.now.clone().with_time_zone(tz);
-                    let location = clock_display_name(tz_name);
-                    let time_str = self.format_clock_time(&zoned);
+                    let glyph = if (6..18).contains(&zoned.hour()) {
+                        "weather-clear-symbolic"
+                    } else {
+                        "weather-clear-night-symbolic"
+                    };
+                    let mut place = row![
+                        icon::from_name(glyph).size(16),
+                        text::body(clock_display_name(tz_name)),
+                    ]
+                    .spacing(space_xxs)
+                    .align_y(Alignment::Center);
+                    let offset = zoned.offset().seconds() - self.now.offset().seconds();
+                    if offset != 0 {
+                        place = place.push(text::caption(format_offset(offset)));
+                    }
                     content = content.push(
                         row![
-                            text::body(format!("{location}:")).width(Length::Fill),
-                            text::body(time_str),
+                            place.width(Length::Fill),
+                            text::body(self.format_clock_time(&zoned)),
                         ]
+                        .align_y(Alignment::Center)
                         .padding([4, 20]),
                     );
                 }
@@ -446,7 +945,10 @@ impl Window {
 
     fn settings_view(&self) -> Element<'_, Message> {
         let Spacing {
-            space_s, space_m, ..
+            space_xxs,
+            space_s,
+            space_m,
+            ..
         } = theme::active().cosmic().spacing;
 
         let header = row![
@@ -459,144 +961,104 @@ impl Window {
         .spacing(space_s)
         .padding([4, 8]);
 
-        let tab_general = button::custom(
-            text::body("General")
-                .apply(container)
-                .center(Length::Fill),
-        )
-        .width(Length::FillPortion(1))
-        .class(if self.settings_tab == SettingsTab::General {
-            button::ButtonClass::Suggested
-        } else {
-            button::ButtonClass::Standard
-        })
-        .on_press(Message::SetSettingsTab(SettingsTab::General));
+        let tabs = tab_bar::horizontal(&self.tabs)
+            .on_activate(Message::TabActivated)
+            .button_height(28)
+            .padding([space_xxs, space_m]);
 
-        let tab_clocks = button::custom(
-            text::body("Clocks")
-                .apply(container)
-                .center(Length::Fill),
-        )
-        .width(Length::FillPortion(1))
-        .class(if self.settings_tab == SettingsTab::Clocks {
-            button::ButtonClass::Suggested
-        } else {
-            button::ButtonClass::Standard
-        })
-        .on_press(Message::SetSettingsTab(SettingsTab::Clocks));
+        let active_tab = self
+            .tabs
+            .active_data::<SettingsTab>()
+            .copied()
+            .unwrap_or(SettingsTab::General);
 
-        let tabs = row![tab_general, tab_clocks]
-            .spacing(space_s)
-            .padding([space_s, space_m]);
-
-        let tab_content = match self.settings_tab {
-            SettingsTab::General => self.general_settings(),
+        let tab_content: Element<'_, Message> = match active_tab {
+            SettingsTab::General => scrollable(self.general_settings())
+                .height(Length::Fixed(SETTINGS_SCROLL_HEIGHT))
+                .into(),
             SettingsTab::Clocks => self.clocks_settings(),
+            SettingsTab::Calendar => scrollable(self.calendar_settings())
+                .height(Length::Fixed(SETTINGS_SCROLL_HEIGHT))
+                .into(),
         };
 
-        column![
-            header,
-            divider::horizontal::default(),
-            tabs,
-            divider::horizontal::default(),
-            scrollable(tab_content).height(Length::Fixed(SETTINGS_SCROLL_HEIGHT)),
-        ]
-        .into()
+        column![header, tabs, divider::horizontal::default(), tab_content,].into()
     }
 
     fn general_settings(&self) -> Element<'_, Message> {
         let Spacing {
-            space_s, space_m, ..
+            space_xxs,
+            space_s,
+            space_m,
+            ..
         } = theme::active().cosmic().spacing;
-
-        let show_date_row = padded_control(
-            row![
-                text::body("Show date in panel").width(Length::Fill),
-                toggler(self.config.show_date_in_top_panel).on_toggle(Message::SetShowDate),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        let show_weekday_row = padded_control(
-            row![
-                text::body("Show weekday").width(Length::Fill),
-                toggler(self.config.show_weekday).on_toggle(Message::SetShowWeekday),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        let military_row = padded_control(
-            row![
-                text::body("24-hour time").width(Length::Fill),
-                toggler(self.config.military_time).on_toggle(Message::SetMilitaryTime),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        let seconds_row = padded_control(
-            row![
-                text::body("Show seconds").width(Length::Fill),
-                toggler(self.config.show_seconds).on_toggle(Message::SetShowSeconds),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        let first_day_row = padded_control(
-            column![
-                text::body("First day of week"),
-                dropdown(
-                    FIRST_DAY_OPTIONS.as_slice(),
-                    Some(self.config.first_day_of_week as usize),
-                    Message::SetFirstDayOfWeek,
-                )
-                .width(Length::Fill),
-            ]
-            .spacing(space_s),
-        );
+        let divider = || container(divider::horizontal::default()).padding([space_xxs, space_m]);
+        let c = &self.config;
 
         column![
-            container(text::caption("PANEL")).padding([space_s, space_m]),
-            show_date_row,
-            show_weekday_row,
-            container(divider::horizontal::default()).padding([0, space_m]),
-            container(text::caption("TIME")).padding([space_s, space_m]),
-            military_row,
-            seconds_row,
-            container(divider::horizontal::default()).padding([0, space_m]),
-            container(text::caption("CALENDAR")).padding([space_s, space_m]),
-            first_day_row,
+            toggle_row(
+                "Show date in panel",
+                c.show_date_in_top_panel,
+                Message::SetShowDate
+            ),
+            toggle_row("Show weekday", c.show_weekday, Message::SetShowWeekday),
+            divider(),
+            toggle_row("24-hour time", c.military_time, Message::SetMilitaryTime),
+            toggle_row("Show seconds", c.show_seconds, Message::SetShowSeconds),
+            divider(),
+            padded_control(
+                column![
+                    text::body("First day of week"),
+                    opaque(
+                        dropdown(
+                            &FIRST_DAY_OPTIONS,
+                            Some(c.first_day_of_week as usize),
+                            Message::SetFirstDayOfWeek,
+                        )
+                        .width(Length::Fill),
+                    ),
+                ]
+                .spacing(space_s),
+            ),
         ]
         .into()
     }
 
     fn clocks_settings(&self) -> Element<'_, Message> {
-        let Spacing { space_s, .. } = theme::active().cosmic().spacing;
+        let Spacing {
+            space_s, space_m, ..
+        } = theme::active().cosmic().spacing;
 
-        let mut add_col = column![
-            text::body("Add timezone"),
-            row![
-                text_input("e.g. America/New_York", &self.clock_input)
-                    .on_input(Message::SetClockInput)
-                    .on_submit(|_| Message::AddClock)
+        // Kept outside the scrollable so the dropdown overlay is not clipped.
+        let search = padded_control(
+            column![
+                text::body("Search for a city"),
+                opaque(
+                    combo_box::ComboBox::new(
+                        &self.city_combo_state,
+                        "e.g. Tokyo, London, New York…",
+                        None::<&CityEntry>,
+                        Message::SelectCity,
+                    )
                     .width(Length::Fill),
-                button::icon(icon::from_name("list-add-symbolic"))
-                    .padding(8)
-                    .on_press(Message::AddClock),
+                ),
             ]
-            .spacing(space_s)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(space_s);
-        if self.clock_input_error {
-            add_col = add_col.push(text::caption("Invalid timezone name"));
-        }
-        let add_row = padded_control(add_col);
+            .spacing(space_s),
+        );
 
         let mut clocks_list = column![];
+        if self.config.additional_clocks.is_empty() {
+            clocks_list = clocks_list
+                .push(container(text::caption("No clocks added yet")).padding([space_s, space_m]));
+        }
         for (i, tz_name) in self.config.additional_clocks.iter().enumerate() {
             clocks_list = clocks_list.push(padded_control(
                 row![
-                    text::body(clock_display_name(tz_name)).width(Length::Fill),
+                    column![
+                        text::body(clock_display_name(tz_name)),
+                        text::caption(tz_name),
+                    ]
+                    .width(Length::Fill),
                     button::icon(icon::from_name("list-remove-symbolic"))
                         .padding(4)
                         .on_press(Message::RemoveClock(i)),
@@ -605,7 +1067,39 @@ impl Window {
             ));
         }
 
-        column![add_row, clocks_list].into()
+        const LIST_HEIGHT: f32 = SETTINGS_SCROLL_HEIGHT - 90.0;
+
+        column![
+            search,
+            divider::horizontal::default(),
+            scrollable(clocks_list).height(Length::Fixed(LIST_HEIGHT)),
+        ]
+        .into()
+    }
+
+    fn calendar_settings(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_s, space_m, ..
+        } = theme::active().cosmic().spacing;
+
+        let persian_row = padded_control(
+            row![
+                column![
+                    text::body("Persian (Shamsi)"),
+                    text::caption("Solar Hijri / Jalali calendar"),
+                ]
+                .width(Length::Fill),
+                toggler(self.config.show_persian_calendar)
+                    .on_toggle(Message::SetShowPersianCalendar),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        column![
+            container(text::caption("ADDITIONAL CALENDARS")).padding([space_s, space_m]),
+            persian_row,
+        ]
+        .into()
     }
 }
 
@@ -621,6 +1115,8 @@ impl cosmic::Application for Window {
         let today = now.date();
 
         let (show_seconds_tx, _) = watch::channel(false);
+        let (tick_tx, _) = watch::channel(None);
+        let (hold_tx, _) = watch::channel(None);
 
         (
             Self {
@@ -637,9 +1133,19 @@ impl cosmic::Application for Window {
                 show_seconds_tx,
                 locale,
                 page: Page::Calendar,
-                settings_tab: SettingsTab::General,
-                clock_input: String::new(),
-                clock_input_error: false,
+                tabs: segmented_button::Model::builder()
+                    .insert(|b| b.text("General").data(SettingsTab::General).activate())
+                    .insert(|b| b.text("Clocks").data(SettingsTab::Clocks))
+                    .insert(|b| b.text("Calendar").data(SettingsTab::Calendar))
+                    .build(),
+                city_combo_state: combo_box::State::new(CITIES.clone()),
+                running_since: None,
+                accumulated: Duration::ZERO,
+                laps: Vec::new(),
+                timer_duration: Duration::from_secs(5 * 60),
+                timer: Timer::Idle,
+                hold_tx,
+                tick_tx,
             },
             Task::none(),
         )
@@ -659,21 +1165,12 @@ impl cosmic::Application for Window {
 
     fn subscription(&self) -> Subscription<Message> {
         fn time_subscription(show_seconds: watch::Receiver<bool>) -> Subscription<Message> {
-            struct Wrapper {
-                inner: watch::Receiver<bool>,
-                id: &'static str,
-            }
-            impl Hash for Wrapper {
-                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                    self.id.hash(state);
-                }
-            }
             Subscription::run_with(
-                Wrapper {
+                Watch {
                     inner: show_seconds,
                     id: "time-sub",
                 },
-                |Wrapper { inner, id: _ }| {
+                |Watch { inner, .. }| {
                     let mut show_seconds = inner.clone();
                     stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
                         show_seconds.mark_changed();
@@ -727,9 +1224,12 @@ impl cosmic::Application for Window {
             let mut stream_tz = proxy.receive_timezone_changed().await;
             while let Some(property) = stream_tz.next().await {
                 let tz = property.get().await?;
-                output.send(Message::TimezoneUpdate(tz)).await.map_err(|e| {
-                    zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(e)))
-                })?;
+                output
+                    .send(Message::TimezoneUpdate(tz))
+                    .await
+                    .map_err(|e| {
+                        zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other(e)))
+                    })?;
             }
             Ok(())
         }
@@ -776,10 +1276,120 @@ impl cosmic::Application for Window {
             })
         }
 
+        fn fast_tick_subscription(
+            tick: watch::Receiver<Option<Duration>>,
+        ) -> Subscription<Message> {
+            Subscription::run_with(
+                Watch {
+                    inner: tick,
+                    id: "fast-tick-sub",
+                },
+                |Watch { inner, .. }| {
+                    let mut tick = inner.clone();
+                    stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
+                        let build = |period: Option<Duration>| {
+                            period.map(|p| {
+                                let mut t = time::interval(p);
+                                t.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                                t
+                            })
+                        };
+                        let mut timer = build(*tick.borrow_and_update());
+                        loop {
+                            match timer.as_mut() {
+                                Some(t) => {
+                                    tokio::select! {
+                                        _ = t.tick() => {
+                                            let _ = output.send(Message::FastTick).await;
+                                        }
+                                        Ok(()) = tick.changed() => {
+                                            timer = build(*tick.borrow_and_update());
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if tick.changed().await.is_ok() {
+                                        timer = build(*tick.borrow_and_update());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+        }
+
+        // Emits TimerHoldTick at an accelerating rate while a timer arrow is held.
+        fn hold_repeat_subscription(hold: watch::Receiver<Option<i64>>) -> Subscription<Message> {
+            fn hold_delay(count: u32) -> Duration {
+                let ms = 360u64.saturating_sub(count as u64 * 35).max(45);
+                Duration::from_millis(ms)
+            }
+            Subscription::run_with(
+                Watch {
+                    inner: hold,
+                    id: "timer-hold-sub",
+                },
+                |Watch { inner, .. }| {
+                    let mut hold = inner.clone();
+                    stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
+                        loop {
+                            if hold.borrow_and_update().is_none() {
+                                if hold.changed().await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Any change (release or a new press) restarts the acceleration.
+                            let mut count: u32 = 1;
+                            loop {
+                                tokio::select! {
+                                    _ = time::sleep(hold_delay(count)) => {
+                                        if output.send(Message::TimerHoldTick).await.is_err() {
+                                            return;
+                                        }
+                                        count += 1;
+                                    }
+                                    res = hold.changed() => {
+                                        if res.is_err() {
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+        }
+
+        // Ends a stepper hold on any pointer release. mouse_area only sees releases
+        // inside its own bounds, so it would miss the cursor drifting off the arrow.
+        fn release_listener(
+            event: cosmic::iced::Event,
+            _status: cosmic::iced::event::Status,
+            _id: window::Id,
+        ) -> Option<Message> {
+            use cosmic::iced::{Event, mouse, touch};
+            match event {
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerLifted { .. })
+                | Event::Touch(touch::Event::FingerLost { .. }) => Some(Message::TimerHoldStop),
+                _ => None,
+            }
+        }
+
         let show_seconds_rx = self.show_seconds_tx.subscribe();
-        Subscription::batch([
+        let tick_rx = self.tick_tx.subscribe();
+        let hold_rx = self.hold_tx.subscribe();
+        let mut subscriptions = vec![
             rectangle_tracker_subscription(0).map(|e| Message::Rectangle(e.1)),
             time_subscription(show_seconds_rx),
+            fast_tick_subscription(tick_rx),
+            hold_repeat_subscription(hold_rx),
             activation_token_subscription(0).map(Message::Token),
             timezone_subscription(),
             wake_from_sleep_subscription(),
@@ -789,45 +1399,75 @@ impl cosmic::Application for Window {
                 }
                 Message::ConfigChanged(u.config)
             }),
-        ])
+        ];
+        if self.hold_tx.borrow().is_some() {
+            subscriptions.push(cosmic::iced::event::listen_with(release_listener));
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         match message {
             Message::TogglePopup => {
                 if let Some(p) = self.popup.take() {
+                    self.refresh_tick();
                     destroy_popup(p)
                 } else {
                     self.date_today = self.now.date();
                     self.date_selected = self.date_today;
-                    self.page = Page::Calendar;
+                    // Opening the popup dismisses a finished timer.
+                    if self.timer_finished() {
+                        self.timer = Timer::Idle;
+                    }
+                    self.page = if self.timer_active() {
+                        Page::Timer
+                    } else if self.running_since.is_some() {
+                        Page::Stopwatch
+                    } else {
+                        Page::Calendar
+                    };
 
                     let new_id = window::Id::unique();
                     self.popup = Some(new_id);
+                    self.refresh_tick();
 
-                    let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
-                        new_id,
+                    // Open through the surface tracker (not raw get_popup) so
+                    // libcosmic applies the theme's frosted-glass blur and
+                    // corner radius to the popup when "frosted applets" is on.
+                    cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                        |_| Default::default(),
+                        move |app: &mut Self| {
+                            let mut popup_settings = app.core.applet.get_popup_settings(
+                                app.core.main_window_id().unwrap(),
+                                new_id,
+                                None,
+                                None,
+                                None,
+                            );
+                            let Rectangle {
+                                x,
+                                y,
+                                width,
+                                height,
+                            } = app.rectangle;
+                            popup_settings.positioner.anchor_rect = Rectangle::<i32> {
+                                x: x.max(1.) as i32,
+                                y: y.max(1.) as i32,
+                                width: width.max(1.) as i32,
+                                height: height.max(1.) as i32,
+                            };
+                            popup_settings.positioner.size = None;
+                            popup_settings
+                        },
                         None,
-                        None,
-                        None,
-                    );
-                    let Rectangle { x, y, width, height } = self.rectangle;
-                    popup_settings.positioner.anchor_rect = Rectangle::<i32> {
-                        x: x.max(1.) as i32,
-                        y: y.max(1.) as i32,
-                        width: width.max(1.) as i32,
-                        height: height.max(1.) as i32,
-                    };
-                    popup_settings.positioner.size = None;
-                    get_popup(popup_settings)
+                    ))
                 }
             }
             Message::Tick => {
-                self.now = self.timezone.as_ref().map_or_else(
-                    Zoned::now,
-                    |tz| Zoned::now().with_time_zone(tz.clone()),
-                );
+                self.now = self
+                    .timezone
+                    .as_ref()
+                    .map_or_else(Zoned::now, |tz| Zoned::now().with_time_zone(tz.clone()));
                 Task::none()
             }
             Message::Rectangle(u) => {
@@ -854,17 +1494,18 @@ impl cosmic::Application for Window {
             Message::PreviousMonth => {
                 if let Ok(date) = self.date_selected.checked_sub(1.month()) {
                     self.date_selected = date;
-                } else {
-                    tracing::error!("invalid date");
                 }
                 Task::none()
             }
             Message::NextMonth => {
                 if let Ok(date) = self.date_selected.checked_add(1.month()) {
                     self.date_selected = date;
-                } else {
-                    tracing::error!("invalid date");
                 }
+                Task::none()
+            }
+            Message::GoToToday => {
+                self.date_today = self.now.date();
+                self.date_selected = self.date_today;
                 Task::none()
             }
             Message::ToggleSettings => {
@@ -873,6 +1514,7 @@ impl cosmic::Application for Window {
                 } else {
                     Page::Settings
                 };
+                self.refresh_tick();
                 Task::none()
             }
             Message::Token(u) => {
@@ -904,11 +1546,6 @@ impl cosmic::Application for Window {
                 }
                 self.update(Message::Tick)
             }
-            Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(a),
-                ));
-            }
             Message::SetMilitaryTime(v) => {
                 self.config.military_time = v;
                 self.save_config();
@@ -934,36 +1571,140 @@ impl cosmic::Application for Window {
                 self.save_config();
                 Task::none()
             }
-            Message::SetSettingsTab(tab) => {
-                self.settings_tab = tab;
+            Message::TabActivated(entity) => {
+                self.tabs.activate(entity);
                 Task::none()
             }
-            Message::SetClockInput(s) => {
-                self.clock_input = s;
-                self.clock_input_error = false;
-                Task::none()
-            }
-            Message::AddClock => {
-                let input = self.clock_input.trim().to_string();
-                if input.is_empty() {
-                    return Task::none();
-                }
-                if TimeZone::get(&input).is_err() {
-                    self.clock_input_error = true;
-                    return Task::none();
-                }
-                if !self.config.additional_clocks.contains(&input) {
-                    self.config.additional_clocks.push(input);
+            Message::SelectCity(entry) => {
+                if !self.config.additional_clocks.contains(&entry.timezone) {
+                    self.config.additional_clocks.push(entry.timezone);
                     self.save_config();
                 }
-                self.clock_input.clear();
-                self.clock_input_error = false;
+                // Recreate state to clear the search text
+                self.city_combo_state = combo_box::State::new(CITIES.clone());
                 Task::none()
             }
             Message::RemoveClock(i) => {
                 if i < self.config.additional_clocks.len() {
                     self.config.additional_clocks.remove(i);
                     self.save_config();
+                }
+                Task::none()
+            }
+            Message::SetShowPersianCalendar(v) => {
+                self.config.show_persian_calendar = v;
+                self.save_config();
+                Task::none()
+            }
+            Message::ToggleStopwatch => {
+                self.page = if self.page == Page::Stopwatch {
+                    Page::Calendar
+                } else {
+                    Page::Stopwatch
+                };
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchStartPause => {
+                match self.running_since.take() {
+                    Some(start) => self.accumulated += start.elapsed(),
+                    None => self.running_since = Some(Instant::now()),
+                }
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchReset => {
+                self.running_since = None;
+                self.accumulated = Duration::ZERO;
+                self.laps.clear();
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchLap => {
+                self.laps.push(self.stopwatch_elapsed());
+                Task::none()
+            }
+            Message::ToggleTimer => {
+                self.page = if self.page == Page::Timer {
+                    Page::Calendar
+                } else {
+                    Page::Timer
+                };
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerStartPause => {
+                let now = Instant::now();
+                self.timer = match self.timer {
+                    Timer::Running { deadline } => Timer::Paused {
+                        remaining: deadline.saturating_duration_since(now),
+                    },
+                    Timer::Paused { remaining } => Timer::Running {
+                        deadline: now + remaining,
+                    },
+                    _ if self.timer_duration > Duration::ZERO => Timer::Running {
+                        deadline: now + self.timer_duration,
+                    },
+                    other => other,
+                };
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerReset => {
+                self.timer = Timer::Idle;
+                self.timer_duration = Duration::ZERO;
+                self.refresh_tick();
+                Task::none()
+            }
+            // Clears a finished timer but keeps its duration for the next run.
+            Message::TimerDismiss => {
+                self.timer = Timer::Idle;
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerAdd(delta) => {
+                self.timer_add(delta);
+                Task::none()
+            }
+            Message::TimerPreset(secs) => {
+                if self.timer == Timer::Idle {
+                    self.timer_duration = Duration::from_secs(secs);
+                    return self.update(Message::TimerStartPause);
+                }
+                Task::none()
+            }
+            Message::TimerHoldStart(delta) => {
+                self.timer_add(delta);
+                self.hold_tx.send_replace(Some(delta));
+                Task::none()
+            }
+            Message::TimerHoldStop => {
+                self.hold_tx.send_replace(None);
+                Task::none()
+            }
+            Message::TimerHoldTick => {
+                let held = *self.hold_tx.borrow();
+                if let Some(delta) = held {
+                    self.timer_add(delta);
+                }
+                Task::none()
+            }
+            Message::FastTick => {
+                if self.timer_running() && self.timer_remaining().is_zero() {
+                    self.timer = Timer::Finished { at: Instant::now() };
+                    self.refresh_tick();
+                    let label = format_elapsed_short(self.timer_duration);
+                    return cosmic::task::future(async move {
+                        if let Err(err) = send_notification(
+                            "Timer finished".to_string(),
+                            format!("Your {label} timer is done."),
+                        )
+                        .await
+                        {
+                            tracing::error!(?err, "Failed to send timer notification");
+                        }
+                        cosmic::Action::None
+                    });
                 }
                 Task::none()
             }
@@ -976,7 +1717,21 @@ impl cosmic::Application for Window {
             PanelAnchor::Top | PanelAnchor::Bottom
         );
 
-        let button = button::custom(if horizontal {
+        let button = button::custom(if self.timer_active() {
+            self.panel_indicator(
+                horizontal,
+                "alarm-symbolic",
+                format_elapsed_short(self.timer_remaining()),
+                self.timer_text_class(),
+            )
+        } else if self.running_since.is_some() {
+            self.panel_indicator(
+                horizontal,
+                "accessories-clock-symbolic",
+                format_elapsed_short(self.stopwatch_elapsed()),
+                theme::Text::Default,
+            )
+        } else if horizontal {
             self.horizontal_layout()
         } else {
             self.vertical_layout()
@@ -1004,6 +1759,8 @@ impl cosmic::Application for Window {
         let content = match self.page {
             Page::Calendar => self.calendar_view(),
             Page::Settings => self.settings_view(),
+            Page::Stopwatch => self.stopwatch_view(),
+            Page::Timer => self.timer_view(),
         };
         self.core.applet.popup_container(container(content)).into()
     }
@@ -1013,7 +1770,21 @@ impl cosmic::Application for Window {
     }
 }
 
-fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<'static, Message> {
+fn to_farsi_digits(n: u8) -> String {
+    // Persian digits are contiguous from U+06F0.
+    n.to_string()
+        .chars()
+        .map(|c| char::from_u32(0x06F0 + c.to_digit(10).unwrap()).unwrap())
+        .collect()
+}
+
+fn date_button(
+    day: i8,
+    is_month: bool,
+    is_day: bool,
+    is_today: bool,
+    persian_day: Option<u8>,
+) -> Button<'static, Message> {
     let style = if is_day {
         button::ButtonClass::Suggested
     } else if is_today {
@@ -1022,14 +1793,29 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
         button::ButtonClass::Text
     };
 
-    let button = button::custom(
+    let content: Element<'static, Message> = if let Some(pd) = persian_day {
+        let gregorian_center = text(format!("{day}"))
+            .size(16)
+            .apply(container)
+            .center(Length::Fill);
+        let farsi_bottom = text(to_farsi_digits(pd))
+            .size(10)
+            .apply(container)
+            .align_x(Alignment::Center)
+            .width(Length::Fill)
+            .padding([0, 0, 2, 0]);
+        column![gregorian_center, farsi_bottom].into()
+    } else {
         text::body(format!("{day}"))
             .apply(container)
-            .center(Length::Fill),
-    )
-    .class(style)
-    .height(Length::Fixed(44.0))
-    .width(Length::Fixed(44.0));
+            .center(Length::Fill)
+            .into()
+    };
+
+    let button = button::custom(content)
+        .class(style)
+        .height(Length::Fixed(44.0))
+        .width(Length::Fixed(44.0));
 
     if is_month {
         button.on_press(Message::SelectDay(day))
@@ -1038,3 +1824,30 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readouts() {
+        let d = Duration::from_millis(3_723_450);
+        assert_eq!(format_elapsed_short(d), "1:02:03");
+        assert_eq!(format_elapsed(d), "1:02:03.45");
+        assert_eq!(format_elapsed(Duration::from_millis(83_450)), "01:23.45");
+        assert_eq!(to_farsi_digits(29), "۲۹");
+        assert_eq!(clock_display_name("America/New_York"), "New York");
+        assert_eq!(clock_display_name("UTC"), "UTC");
+        assert_eq!(format_offset(34_200), "+9:30");
+        assert_eq!(format_offset(-25_200), "-7");
+    }
+
+    #[test]
+    fn icu_dates() {
+        let date = Date::constant(2026, 9, 17);
+        assert_eq!(icu_date(date).to_calendar(Persian).day_of_month().0, 26);
+        assert!(format_shamsi_date(date).contains("۱۴۰۵"));
+        let prefs = DateTimeFormatterPreferences::from(locale!("en-US"));
+        let weekday = DateTimeFormatter::try_new(prefs, fieldsets::E::short()).unwrap();
+        assert_eq!(weekday.format(&icu_date(date)).to_string(), "Thu");
+    }
+}

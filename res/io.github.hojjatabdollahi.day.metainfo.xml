@@ -1,16 +1,54 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.hojjatabdollahi.day</id>
-  <name>Date, Time &amp; Calendar</name>
-  <summary>Display the current time in the panel with a calendar popup</summary>
-  <developer_name>Hojjat</developer_name>
-  <update_contact>hojjat@example.com</update_contact>
+  <name>Day</name>
+  <summary>Clock, calendar, world clocks, stopwatch and timer for COSMIC</summary>
+  <launchable type="desktop-id">io.github.hojjatabdollahi.day.desktop</launchable>
+  <developer id="io.github.hojjatabdollahi">
+    <name>Hojjat</name>
+  </developer>
+  <description>
+    <p>Clock applet for the COSMIC panel. With timer, stopwatch, world clock, and optional Persian (Shamsi) calendar.</p>
+    <ul>
+      <li>Clock in the panel with optional date, weekday and seconds, in 12 or 24-hour time</li>
+      <li>Month calendar with a configurable first day of the week and a jump back to today</li>
+      <li>Persian (Shamsi) calendar overlay</li>
+      <li>World clocks with offline city search, a day/night indicator and the offset from local time</li>
+      <li>Stopwatch with laps</li>
+      <li>Countdown timer with Pomodoro presets and a notification when it finishes</li>
+      <li>Follows system timezone changes and refreshes on wake from sleep</li>
+    </ul>
+  </description>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/hojjatabdollahi/day/master/res/screenshots/1.png</image>
+      <caption>Calendar with a world clock</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/hojjatabdollahi/day/master/res/screenshots/5.png</image>
+      <caption>Persian calendar overlay and world clocks with offsets</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/hojjatabdollahi/day/master/res/screenshots/3.png</image>
+      <caption>Countdown timer with Pomodoro presets</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/hojjatabdollahi/day/master/res/screenshots/2.png</image>
+      <caption>Stopwatch with laps</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/hojjatabdollahi/day/master/res/screenshots/4.png</image>
+      <caption>Settings</caption>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://github.com/hojjatabdollahi/day</url>
   <metadata_license>FSFAP</metadata_license>
   <project_license>GPL-3.0-only</project_license>
+  <content_rating type="oars-1.1"/>
   <provides>
-    <binary>cosmic-applet-time</binary>
+    <binary>day</binary>
   </provides>
   <releases>
-    <release version="1.0.2" date="2026-04-17"/>
+    <release version="1.0.0" date="2026-09-17"/>
   </releases>
 </component>

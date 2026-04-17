@@ -1,0 +1,55 @@
+app-id: io.github.hojjatabdollahi.day
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+# Provides the Cosmic/Pop icon themes so the named symbolic icons resolve.
+base: com.system76.Cosmic.BaseApp
+base-version: stable
+command: day
+
+finish-args:
+  # cosmic-panel forwards its Wayland socket to the applet
+  - --socket=wayland
+  # GPU rendering
+  - --device=dri
+  # Own config + theme live under ~/.config/cosmic
+  # flathub-linter: skip=finish-args-unnecessary-xdg-config-cosmic-rw-access
+  - --filesystem=xdg-config/cosmic:rw
+  # Live theme/config updates
+  - --talk-name=com.system76.CosmicSettingsDaemon
+  - --talk-name=com.system76.CosmicSettingsDaemon.*
+  # "Timer finished" desktop notification
+  - --talk-name=org.freedesktop.Notifications
+  # Follow system timezone changes
+  - --system-talk-name=org.freedesktop.timedate1
+  # Refresh the clock on wake from suspend
+  - --system-talk-name=org.freedesktop.login1
+
+modules:
+  - name: day
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/day/cargo
+        CARGO_TARGET_DIR: /run/build/day/target
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/day /app/bin/day
+      - install -Dm644 res/io.github.hojjatabdollahi.day.desktop /app/share/applications/io.github.hojjatabdollahi.day.desktop
+      - install -Dm644 res/io.github.hojjatabdollahi.day.metainfo.xml /app/share/metainfo/io.github.hojjatabdollahi.day.metainfo.xml
+      - install -Dm644 res/icons/scalable/apps/io.github.hojjatabdollahi.day.svg /app/share/icons/hicolor/scalable/apps/io.github.hojjatabdollahi.day.svg
+    sources:
+      - type: dir
+        path: .
+        # Don't copy local build output into the sandbox (target/ alone is GBs)
+        skip:
+          - target
+          - build-dir
+          - .flatpak-builder
+          - .flatpak-venv
+          - .git
+      - cargo-sources.json

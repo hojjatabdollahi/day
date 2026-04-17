@@ -1,1 +1,10 @@
 /target
+
+# Flatpak
+/build-dir
+/.flatpak-builder
+/repo
+/cargo-sources.json
+/flatpak-cargo-generator.py
+/.flatpak-venv
+*.flatpak
