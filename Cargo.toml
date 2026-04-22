@@ -1,5 +1,5 @@
 [package]
-name = "cosmic-applet-time"
+name = "day"
 version = "1.0.2"
 edition = "2024"
 license = "GPL-3.0-only"

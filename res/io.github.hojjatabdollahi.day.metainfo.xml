@@ -8,7 +8,7 @@
   <metadata_license>FSFAP</metadata_license>
   <project_license>GPL-3.0-only</project_license>
   <provides>
-    <binary>cosmic-applet-time</binary>
+    <binary>day</binary>
   </provides>
   <releases>
     <release version="1.0.2" date="2026-04-17"/>

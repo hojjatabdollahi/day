@@ -48,12 +48,21 @@ use icu::{
         input::{Date as IcuDate, DateTime, Time},
         options::TimePrecision,
     },
-    locale::{Locale, preferences::extensions::unicode::keywords::HourCycle},
+    locale::{
+        Locale,
+        preferences::extensions::unicode::keywords::{CalendarAlgorithm, HourCycle},
+    },
 };
 
 const APPLET_ID: &str = "io.github.hojjatabdollahi.day";
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
+
+static COSMIC_LOGO: LazyLock<cosmic::widget::icon::Handle> = LazyLock::new(|| {
+    cosmic::widget::icon::from_svg_bytes(
+        include_bytes!("../res/icons/bundled/cosmic.svg").as_slice(),
+    )
+});
 
 static FIRST_DAY_OPTIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
     vec![
@@ -80,12 +89,6 @@ pub enum SettingsTab {
     General,
     Clocks,
     Calendar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalendarSystem {
-    Gregorian,
-    Persian,
 }
 
 fn get_system_locale() -> Locale {
@@ -136,7 +139,6 @@ pub struct Window {
     locale: Locale,
     page: Page,
     tabs: segmented_button::SingleSelectModel,
-    active_calendar: CalendarSystem,
     city_combo_state: combo_box::State<CityEntry>,
 }
 
@@ -167,7 +169,6 @@ pub enum Message {
     RemoveClock(usize),
     // Calendar settings
     SetShowPersianCalendar(bool),
-    SetActiveCalendar(CalendarSystem),
 }
 
 impl Window {
@@ -233,14 +234,18 @@ impl Window {
 
     fn calendar_grid(&self) -> Grid<'_, Message> {
         let mut calendar = grid().width(Length::Fill);
-        let first_day_of_week = match self.config.first_day_of_week {
-            0 => Weekday::Monday,
-            1 => Weekday::Tuesday,
-            2 => Weekday::Wednesday,
-            3 => Weekday::Thursday,
-            4 => Weekday::Friday,
-            5 => Weekday::Saturday,
-            _ => Weekday::Sunday,
+        let first_day_of_week = if self.config.show_persian_calendar {
+            Weekday::Friday
+        } else {
+            match self.config.first_day_of_week {
+                0 => Weekday::Monday,
+                1 => Weekday::Tuesday,
+                2 => Weekday::Wednesday,
+                3 => Weekday::Thursday,
+                4 => Weekday::Friday,
+                5 => Weekday::Saturday,
+                _ => Weekday::Sunday,
+            }
         };
 
         let first_day = get_calendar_first(
@@ -254,14 +259,24 @@ impl Window {
 
         for i in 0..7 {
             let date = first_day.checked_add(i.days()).unwrap();
-            let datetime = self.create_datetime(&date);
-            calendar = calendar.push(
+            let cell: Element<'_, Message> = if date.weekday() == Weekday::Tuesday {
+                icon::icon(COSMIC_LOGO.clone())
+                    .size(24)
+                    .apply(container)
+                    .center_x(Length::Fixed(44.0))
+                    .into()
+            } else {
+                let datetime = self.create_datetime(&date);
                 text::caption(weekday.format(&datetime).to_string())
                     .apply(container)
-                    .center_x(Length::Fixed(44.0)),
-            );
+                    .center_x(Length::Fixed(44.0))
+                    .into()
+            };
+            calendar = calendar.push(cell);
         }
         calendar = calendar.insert_row();
+
+        let show_persian = self.config.show_persian_calendar;
 
         for i in 0..42 {
             if i > 0 && i % 7 == 0 {
@@ -275,10 +290,43 @@ impl Window {
             let is_day = date == self.date_selected;
             let is_today = date == self.date_today;
 
-            calendar = calendar.push(date_button(date.day(), is_month, is_day, is_today));
+            let persian_day = if show_persian {
+                Some(self.date_to_persian_icu(&date).day_of_month().0)
+            } else {
+                None
+            };
+
+            calendar = calendar.push(date_button(
+                date.day(),
+                is_month,
+                is_day,
+                is_today,
+                persian_day,
+            ));
         }
 
         calendar
+    }
+
+    fn date_to_persian_icu(&self, date: &Date) -> IcuDate<Persian> {
+        IcuDate::try_new_gregorian(date.year() as i32, date.month() as u8, date.day() as u8)
+            .unwrap()
+            .to_calendar(Persian)
+    }
+
+    fn format_shamsi_date(&self, date: &Date) -> String {
+        let persian = self.date_to_persian_icu(date);
+        let dt = DateTime {
+            date: persian,
+            time: Time::try_new(0, 0, 0, 0).unwrap(),
+        };
+        let fa_locale = Locale::try_from_str("fa").unwrap_or_else(|_| self.locale.clone());
+        let mut fa_prefs = DateTimeFormatterPreferences::from(fa_locale);
+        fa_prefs.calendar_algorithm = Some(CalendarAlgorithm::Persian);
+        DateTimeFormatter::try_new(fa_prefs, fieldsets::YMD::long())
+            .unwrap()
+            .format(&dt)
+            .to_string()
     }
 
     fn vertical_layout(&self) -> Element<'_, Message> {
@@ -398,7 +446,13 @@ impl Window {
         let datetime = self.create_datetime(&self.date_selected);
         let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
 
-        let date = text(self.format_header_date(&self.date_selected)).size(18);
+        let date = text(
+            DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
+                .unwrap()
+                .format(&datetime)
+                .to_string(),
+        )
+        .size(18);
         let day_of_week = text::body(
             DateTimeFormatter::try_new(prefs, fieldsets::E::long())
                 .unwrap()
@@ -420,8 +474,14 @@ impl Window {
             .padding(8)
             .on_press(Message::ToggleSettings);
 
+        let mut date_col = column![date, day_of_week];
+        if self.config.show_persian_calendar {
+            date_col =
+                date_col.push(text::caption(self.format_shamsi_date(&self.date_selected)));
+        }
+
         let header = row![
-            column![date, day_of_week],
+            date_col,
             space::horizontal().width(Length::Fill),
             month_controls,
             settings_btn,
@@ -429,42 +489,7 @@ impl Window {
         .align_y(Alignment::Center)
         .padding([12, 20]);
 
-        let mut content = column![header];
-
-        if self.config.show_persian_calendar {
-            let cal_switcher = row![
-                button::custom(
-                    text::caption("Gregorian")
-                        .apply(container)
-                        .center(Length::Fill),
-                )
-                .width(Length::FillPortion(1))
-                .class(if self.active_calendar == CalendarSystem::Gregorian {
-                    button::ButtonClass::Suggested
-                } else {
-                    button::ButtonClass::Standard
-                })
-                .on_press(Message::SetActiveCalendar(CalendarSystem::Gregorian)),
-                button::custom(
-                    text::caption("Shamsi")
-                        .apply(container)
-                        .center(Length::Fill),
-                )
-                .width(Length::FillPortion(1))
-                .class(if self.active_calendar == CalendarSystem::Persian {
-                    button::ButtonClass::Suggested
-                } else {
-                    button::ButtonClass::Standard
-                })
-                .on_press(Message::SetActiveCalendar(CalendarSystem::Persian)),
-            ]
-            .spacing(space_s)
-            .padding([0, 20, space_s, 20]);
-
-            content = content.push(cal_switcher);
-        }
-
-        content = content.push(self.calendar_grid().padding([0, 12].into()));
+        let mut content = column![header, self.calendar_grid().padding([0, 12].into())];
 
         if !self.config.additional_clocks.is_empty() {
             content = content
@@ -670,39 +695,6 @@ impl Window {
         .into()
     }
 
-    fn format_header_date(&self, date: &jiff::civil::Date) -> String {
-        let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
-        let gregorian = IcuDate::try_new_gregorian(
-            date.year() as i32,
-            date.month() as u8,
-            date.day() as u8,
-        )
-        .unwrap();
-
-        match self.active_calendar {
-            CalendarSystem::Gregorian => {
-                let dt = DateTime {
-                    date: gregorian,
-                    time: Time::try_new(0, 0, 0, 0).unwrap(),
-                };
-                DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
-                    .unwrap()
-                    .format(&dt)
-                    .to_string()
-            }
-            CalendarSystem::Persian => {
-                let persian = gregorian.to_calendar(Persian);
-                let dt = DateTime {
-                    date: persian,
-                    time: Time::try_new(0, 0, 0, 0).unwrap(),
-                };
-                DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
-                    .unwrap()
-                    .format(&dt)
-                    .to_string()
-            }
-        }
-    }
 }
 
 impl cosmic::Application for Window {
@@ -738,7 +730,6 @@ impl cosmic::Application for Window {
                     .insert(|b| b.text("Clocks").data(SettingsTab::Clocks))
                     .insert(|b| b.text("Calendar").data(SettingsTab::Calendar))
                     .build(),
-                active_calendar: CalendarSystem::Gregorian,
                 city_combo_state: combo_box::State::new(CITIES.clone()),
             },
             Task::none(),
@@ -962,16 +953,12 @@ impl cosmic::Application for Window {
             Message::PreviousMonth => {
                 if let Ok(date) = self.date_selected.checked_sub(1.month()) {
                     self.date_selected = date;
-                } else {
-                    tracing::error!("invalid date");
                 }
                 Task::none()
             }
             Message::NextMonth => {
                 if let Ok(date) = self.date_selected.checked_add(1.month()) {
                     self.date_selected = date;
-                } else {
-                    tracing::error!("invalid date");
                 }
                 Task::none()
             }
@@ -1064,14 +1051,7 @@ impl cosmic::Application for Window {
             }
             Message::SetShowPersianCalendar(v) => {
                 self.config.show_persian_calendar = v;
-                if !v && self.active_calendar == CalendarSystem::Persian {
-                    self.active_calendar = CalendarSystem::Gregorian;
-                }
                 self.save_config();
-                Task::none()
-            }
-            Message::SetActiveCalendar(cal) => {
-                self.active_calendar = cal;
                 Task::none()
             }
         }
@@ -1120,7 +1100,32 @@ impl cosmic::Application for Window {
     }
 }
 
-fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<'static, Message> {
+fn to_farsi_digits(n: u8) -> String {
+    n.to_string()
+        .chars()
+        .map(|c| match c {
+            '0' => '۰',
+            '1' => '۱',
+            '2' => '۲',
+            '3' => '۳',
+            '4' => '۴',
+            '5' => '۵',
+            '6' => '۶',
+            '7' => '۷',
+            '8' => '۸',
+            '9' => '۹',
+            other => other,
+        })
+        .collect()
+}
+
+fn date_button(
+    day: i8,
+    is_month: bool,
+    is_day: bool,
+    is_today: bool,
+    persian_day: Option<u8>,
+) -> Button<'static, Message> {
     let style = if is_day {
         button::ButtonClass::Suggested
     } else if is_today {
@@ -1129,14 +1134,29 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
         button::ButtonClass::Text
     };
 
-    let button = button::custom(
+    let content: Element<'static, Message> = if let Some(pd) = persian_day {
+        let gregorian_center = text(format!("{day}"))
+            .size(16)
+            .apply(container)
+            .center(Length::Fill);
+        let farsi_bottom = text(to_farsi_digits(pd))
+            .size(10)
+            .apply(container)
+            .align_x(Alignment::Center)
+            .width(Length::Fill)
+            .padding([0, 0, 2, 0]);
+        column![gregorian_center, farsi_bottom].into()
+    } else {
         text::body(format!("{day}"))
             .apply(container)
-            .center(Length::Fill),
-    )
-    .class(style)
-    .height(Length::Fixed(44.0))
-    .width(Length::Fixed(44.0));
+            .center(Length::Fill)
+            .into()
+    };
+
+    let button = button::custom(content)
+        .class(style)
+        .height(Length::Fixed(44.0))
+        .width(Length::Fixed(44.0));
 
     if is_month {
         button.on_press(Message::SelectDay(day))

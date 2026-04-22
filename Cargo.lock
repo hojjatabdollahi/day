@@ -889,28 +889,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-applet-time"
-version = "1.0.2"
-dependencies = [
- "cosmic-config",
- "i18n-embed",
- "i18n-embed-fl",
- "icu",
- "jiff",
- "libcosmic",
- "logind-zbus",
- "rust-embed",
- "serde",
- "serde_json",
- "timedate-zbus",
- "tokio",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "zbus",
-]
-
-[[package]]
 name = "cosmic-client-toolkit"
 version = "0.2.0"
 source = "git+https://github.com/pop-os/cosmic-protocols?rev=160b086#160b086abe03cd34a8a375d7fbe47b24308d1f38"
@@ -1212,6 +1190,28 @@ name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
+
+[[package]]
+name = "day"
+version = "1.0.2"
+dependencies = [
+ "cosmic-config",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "icu",
+ "jiff",
+ "libcosmic",
+ "logind-zbus",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "timedate-zbus",
+ "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "zbus",
+]
 
 [[package]]
 name = "deranged"

@@ -2,7 +2,7 @@
 Name=Date, Time & Calendar
 Comment=Display the current time in the panel with a calendar popup
 Type=Application
-Exec=cosmic-applet-time
+Exec=day
 Terminal=false
 Categories=COSMIC;
 Keywords=COSMIC;Applet;Date;Time;Calendar;

@@ -44,7 +44,7 @@ dev *args:
 
 # Run with debug logs
 run *args:
-    env RUST_LOG=cosmic_applet_time=info RUST_BACKTRACE=full cargo run {{args}}
+    env RUST_LOG=day=info RUST_BACKTRACE=full cargo run {{args}}
 
 # Installs files
 install:
@@ -52,7 +52,7 @@ install:
     install -Dm0755 {{bin-src}} {{bin-dst}}
     install -Dm0644 {{desktop-src}} {{desktop-dst}}
     install -Dm0644 {{metainfo-src}} {{metainfo-dst}}
-    for svg in {{icons-src}}/apps/*.svg; do \
+    for svg in {{icons-src}}/scalable/apps/*.svg; do \
         install -D "$svg" "{{icons-dst}}/apps/$(basename $svg)"; \
     done
 
@@ -61,7 +61,7 @@ uninstall:
     rm {{bin-dst}}
     rm {{desktop-dst}}
     rm {{metainfo-dst}}
-    for svg in {{icons-src}}/apps/*.svg; do \
+    for svg in {{icons-src}}/scalable/apps/*.svg; do \
         rm "{{icons-dst}}/apps/$(basename $svg)"; \
     done
 
