@@ -8,7 +8,7 @@ use cosmic::{
     iced::stream,
     iced::widget::Column,
     iced::{
-        Alignment, Length, Rectangle, Subscription,
+        Alignment, Color, Length, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
         widget::{column, row, rule, scrollable},
@@ -86,6 +86,7 @@ pub enum Page {
     Calendar,
     Settings,
     Stopwatch,
+    Timer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,8 +150,14 @@ pub struct Window {
     running_since: Option<Instant>,
     accumulated: Duration,
     laps: Vec<Duration>,
-    // Carries the desired repaint cadence to the stopwatch subscription:
-    // None parks it, Some(period) ticks at that period.
+    // Countdown timer. Like the stopwatch, the remaining time is derived from a
+    // monotonic deadline rather than decremented per tick.
+    timer_duration: Duration,            // configured length, editable while idle
+    timer_deadline: Option<Instant>,     // Some while running
+    timer_paused: Option<Duration>,      // remaining, Some while paused
+    timer_finished_at: Option<Instant>,  // when it reached zero; drives the blink
+    // Carries the desired repaint cadence to the fast-tick subscription that
+    // drives both the stopwatch and the timer: None parks it, Some(period) ticks.
     tick_tx: watch::Sender<Option<Duration>>,
 }
 
@@ -169,7 +176,7 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-/// Compact stopwatch readout for the panel, no centiseconds: "01:23" or "1:02:03".
+/// Compact stopwatch/timer readout for the panel, no centiseconds: "01:23" or "1:02:03".
 fn format_elapsed_short(d: Duration) -> String {
     let total_secs = d.as_secs();
     let secs = total_secs % 60;
@@ -180,6 +187,33 @@ fn format_elapsed_short(d: Duration) -> String {
     } else {
         format!("{mins:02}:{secs:02}")
     }
+}
+
+/// Post a desktop notification on the session bus. Best-effort: any failure is
+/// logged by the caller and otherwise ignored.
+async fn send_notification(summary: String, body: String) -> zbus::Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let actions: Vec<&str> = Vec::new();
+    let hints: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> =
+        std::collections::HashMap::new();
+    conn.call_method(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        Some("org.freedesktop.Notifications"),
+        "Notify",
+        &(
+            "Day",            // app_name
+            0u32,             // replaces_id
+            "alarm-symbolic", // app_icon
+            summary,          // summary
+            body,             // body
+            actions,          // actions
+            hints,            // hints
+            -1i32,            // expire_timeout (default)
+        ),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +248,13 @@ pub enum Message {
     StopwatchStartPause,
     StopwatchReset,
     StopwatchLap,
-    StopwatchTick,
+    // Timer
+    ToggleTimer,
+    TimerStartPause,
+    TimerReset,
+    TimerAdd(i64),
+    // Shared repaint tick for the stopwatch and timer
+    FastTick,
 }
 
 impl Window {
@@ -379,16 +419,244 @@ impl Window {
         self.accumulated + self.running_since.map_or(Duration::ZERO, |t| t.elapsed())
     }
 
-    /// Repaint cadence for the stopwatch subscription. Fast while the readout
-    /// is on screen, slow while only the panel needs it, off when stopped.
+    /// Repaint cadence for the fast-tick subscription, serving the stopwatch and
+    /// timer together. Fast while a readout is on screen, slow while only the
+    /// panel needs it, off when neither is counting.
     fn desired_tick(&self) -> Option<Duration> {
-        if self.running_since.is_none() {
+        let counting = self.running_since.is_some() || self.timer_running();
+        let base = if !counting {
             None
-        } else if self.popup.is_some() && self.page == Page::Stopwatch {
+        } else if self.popup.is_some()
+            && (self.page == Page::Stopwatch || self.page == Page::Timer)
+        {
             Some(Duration::from_millis(100))
         } else {
             Some(Duration::from_secs(1))
+        };
+        // A finished timer blinks, so it needs a steady ~500ms repaint even
+        // when nothing is counting.
+        if self.timer_finished() {
+            let blink = Duration::from_millis(500);
+            Some(base.map_or(blink, |b| b.min(blink)))
+        } else {
+            base
         }
+    }
+
+    fn timer_running(&self) -> bool {
+        self.timer_deadline.is_some()
+    }
+
+    fn timer_finished(&self) -> bool {
+        self.timer_finished_at.is_some()
+    }
+
+    /// Red while the last 10 seconds count down. When finished, alternates
+    /// between red and transparent every 500ms to flash the zeroed readout.
+    fn timer_text_color(&self) -> Option<Color> {
+        let red = || Color::from(theme::active().cosmic().destructive.base);
+        if let Some(finished_at) = self.timer_finished_at {
+            let on = (finished_at.elapsed().as_millis() / 500) % 2 == 0;
+            Some(if on { red() } else { Color::TRANSPARENT })
+        } else if self.timer_running() && self.timer_remaining() <= Duration::from_secs(10) {
+            Some(red())
+        } else {
+            None
+        }
+    }
+
+    /// Text style for the timer readout, red/flashing per `timer_text_color`.
+    fn timer_text_class(&self) -> theme::Text {
+        self.timer_text_color()
+            .map_or(theme::Text::Default, theme::Text::Color)
+    }
+
+    /// Time left on the timer, whichever state it is in.
+    fn timer_remaining(&self) -> Duration {
+        if let Some(deadline) = self.timer_deadline {
+            deadline.saturating_duration_since(Instant::now())
+        } else if let Some(paused) = self.timer_paused {
+            paused
+        } else {
+            self.timer_duration
+        }
+    }
+
+    /// True when the timer should claim the panel and the click-to-open page.
+    fn timer_active(&self) -> bool {
+        self.timer_running() || self.timer_finished()
+    }
+
+    /// Compact countdown / alarm indicator shown on the panel.
+    fn timer_panel(&self, horizontal: bool) -> Element<'_, Message> {
+        // A finished timer reads zero and flashes; otherwise show what's left.
+        let remaining = if self.timer_finished() {
+            Duration::ZERO
+        } else {
+            self.timer_remaining()
+        };
+        let label = self
+            .core
+            .applet
+            .text(format_elapsed_short(remaining))
+            .class(self.timer_text_class());
+        let glyph =
+            icon::from_name("alarm-symbolic").size(self.core.applet.suggested_size(true).0);
+        if horizontal {
+            Element::from(
+                row!(
+                    glyph,
+                    label,
+                    container(space::vertical().height(Length::Fixed(
+                        (self.core.applet.suggested_size(true).1
+                            + 2 * self.core.applet.suggested_padding(true).1)
+                            as f32
+                    )))
+                )
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+        } else {
+            Element::from(
+                column!(
+                    glyph,
+                    label,
+                    space::horizontal().width(Length::Fixed(
+                        (self.core.applet.suggested_size(true).0
+                            + 2 * self.core.applet.suggested_padding(true).1)
+                            as f32
+                    ))
+                )
+                .spacing(4)
+                .align_x(Alignment::Center),
+            )
+        }
+    }
+
+    fn timer_view(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_xxs,
+            space_s,
+            space_m,
+            ..
+        } = theme::active().cosmic().spacing;
+
+        let header = row![
+            button::icon(icon::from_name("go-previous-symbolic"))
+                .padding(8)
+                .on_press(Message::ToggleTimer),
+            text::heading("Timer"),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(space_s)
+        .padding([4, 8]);
+
+        let running = self.timer_running();
+        let paused = self.timer_paused.is_some();
+        let finished = self.timer_finished();
+        let idle = !running && !paused && !finished;
+        // A finished timer reads zero and flashes.
+        let remaining = if finished {
+            Duration::ZERO
+        } else {
+            self.timer_remaining()
+        };
+
+        let readout = container(
+            text(format_elapsed_short(remaining))
+                .size(48)
+                .class(self.timer_text_class()),
+        )
+        .center_x(Length::Fill)
+        .padding([space_m, 0]);
+
+        let mut content = column![header].spacing(space_s);
+
+        if finished {
+            content = content.push(
+                container(text::heading("Time's up"))
+                    .center_x(Length::Fill)
+                    .padding([0, 0, space_s, 0]),
+            );
+        }
+
+        content = content.push(readout);
+
+        // Steppers to set the duration, shown only while idle.
+        if idle {
+            content = content.push(self.timer_steppers());
+        }
+
+        let controls: Element<'_, Message> = if finished {
+            row![
+                button::suggested("Dismiss").on_press(Message::TimerReset),
+            ]
+            .spacing(space_s)
+            .padding([0, space_m])
+            .into()
+        } else {
+            let primary = {
+                let label = if running { "Pause" } else { "Start" };
+                let b = button::suggested(label);
+                if running || remaining > Duration::ZERO {
+                    b.on_press(Message::TimerStartPause)
+                } else {
+                    b
+                }
+            };
+            let reset = {
+                let b = button::standard("Reset");
+                if running || paused {
+                    b.on_press(Message::TimerReset)
+                } else {
+                    b
+                }
+            };
+            row![reset, space::horizontal().width(Length::Fill), primary]
+                .spacing(space_s)
+                .padding([0, space_m])
+                .into()
+        };
+
+        content = content.push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+        content = content.push(controls);
+
+        content.padding([8, 0]).into()
+    }
+
+    /// Up/down steppers for hours, minutes and seconds.
+    fn timer_steppers(&self) -> Element<'_, Message> {
+        let total = self.timer_duration.as_secs();
+        let hours = total / 3600;
+        let mins = (total / 60) % 60;
+        let secs = total % 60;
+
+        let unit = |label: &'static str, value: u64, step: i64| -> Element<'_, Message> {
+            column![
+                button::icon(icon::from_name("go-up-symbolic"))
+                    .padding(4)
+                    .on_press(Message::TimerAdd(step)),
+                text(format!("{value:02}")).size(28),
+                text::caption(label),
+                button::icon(icon::from_name("go-down-symbolic"))
+                    .padding(4)
+                    .on_press(Message::TimerAdd(-step)),
+            ]
+            .align_x(Alignment::Center)
+            .spacing(4)
+            .into()
+        };
+
+        row![
+            unit("hr", hours, 3600),
+            unit("min", mins, 60),
+            unit("sec", secs, 1),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center)
+        .apply(container)
+        .center_x(Length::Fill)
+        .into()
     }
 
     fn refresh_tick(&self) {
@@ -642,6 +910,10 @@ impl Window {
             .padding(8)
             .on_press(Message::ToggleStopwatch);
 
+        let timer_btn = button::icon(icon::from_name("alarm-symbolic"))
+            .padding(8)
+            .on_press(Message::ToggleTimer);
+
         let settings_btn = button::icon(icon::from_name("preferences-system-symbolic"))
             .padding(8)
             .on_press(Message::ToggleSettings);
@@ -657,6 +929,7 @@ impl Window {
             space::horizontal().width(Length::Fill),
             month_controls,
             stopwatch_btn,
+            timer_btn,
             settings_btn,
         ]
         .align_y(Alignment::Center)
@@ -908,6 +1181,10 @@ impl cosmic::Application for Window {
                 running_since: None,
                 accumulated: Duration::ZERO,
                 laps: Vec::new(),
+                timer_duration: Duration::from_secs(5 * 60),
+                timer_deadline: None,
+                timer_paused: None,
+                timer_finished_at: None,
                 tick_tx,
             },
             Task::none(),
@@ -1048,7 +1325,9 @@ impl cosmic::Application for Window {
             })
         }
 
-        fn stopwatch_subscription(tick: watch::Receiver<Option<Duration>>) -> Subscription<Message> {
+        fn fast_tick_subscription(
+            tick: watch::Receiver<Option<Duration>>,
+        ) -> Subscription<Message> {
             struct Wrapper {
                 inner: watch::Receiver<Option<Duration>>,
                 id: &'static str,
@@ -1061,7 +1340,7 @@ impl cosmic::Application for Window {
             Subscription::run_with(
                 Wrapper {
                     inner: tick,
-                    id: "stopwatch-sub",
+                    id: "fast-tick-sub",
                 },
                 |Wrapper { inner, id: _ }| {
                     let mut tick = inner.clone();
@@ -1080,7 +1359,7 @@ impl cosmic::Application for Window {
                                 Some(t) => {
                                     tokio::select! {
                                         _ = t.tick() => {
-                                            let _ = output.send(Message::StopwatchTick).await;
+                                            let _ = output.send(Message::FastTick).await;
                                         }
                                         Ok(()) = tick.changed() => {
                                             timer = build(*tick.borrow_and_update());
@@ -1107,7 +1386,7 @@ impl cosmic::Application for Window {
         Subscription::batch([
             rectangle_tracker_subscription(0).map(|e| Message::Rectangle(e.1)),
             time_subscription(show_seconds_rx),
-            stopwatch_subscription(tick_rx),
+            fast_tick_subscription(tick_rx),
             activation_token_subscription(0).map(Message::Token),
             timezone_subscription(),
             wake_from_sleep_subscription(),
@@ -1129,7 +1408,16 @@ impl cosmic::Application for Window {
                 } else {
                     self.date_today = self.now.date();
                     self.date_selected = self.date_today;
-                    self.page = if self.running_since.is_some() {
+                    // Opening the applet dismisses a finished timer: it resets
+                    // and the flashing panel indicator goes away.
+                    if self.timer_finished() {
+                        self.timer_deadline = None;
+                        self.timer_paused = None;
+                        self.timer_finished_at = None;
+                    }
+                    self.page = if self.timer_active() {
+                        Page::Timer
+                    } else if self.running_since.is_some() {
                         Page::Stopwatch
                     } else {
                         Page::Calendar
@@ -1325,7 +1613,72 @@ impl cosmic::Application for Window {
                 self.laps.push(self.stopwatch_elapsed());
                 Task::none()
             }
-            Message::StopwatchTick => Task::none(),
+            Message::ToggleTimer => {
+                self.page = if self.page == Page::Timer {
+                    Page::Calendar
+                } else {
+                    Page::Timer
+                };
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerStartPause => {
+                match self.timer_deadline.take() {
+                    // Was running: freeze the remaining time.
+                    Some(deadline) => {
+                        self.timer_paused = Some(deadline.saturating_duration_since(Instant::now()));
+                    }
+                    // Was paused or idle: count down from whatever is left.
+                    None => {
+                        let remaining = self.timer_paused.take().unwrap_or(self.timer_duration);
+                        if remaining > Duration::ZERO {
+                            self.timer_deadline = Some(Instant::now() + remaining);
+                        }
+                    }
+                }
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerReset => {
+                self.timer_deadline = None;
+                self.timer_paused = None;
+                self.timer_finished_at = None;
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::TimerAdd(delta) => {
+                // Editing the duration is only meaningful while idle.
+                if self.timer_deadline.is_none()
+                    && self.timer_paused.is_none()
+                    && !self.timer_finished()
+                {
+                    let secs = (self.timer_duration.as_secs() as i64 + delta).clamp(0, 99 * 3600);
+                    self.timer_duration = Duration::from_secs(secs as u64);
+                }
+                Task::none()
+            }
+            Message::FastTick => {
+                // Detect the countdown reaching zero.
+                if self.timer_deadline.is_some() && self.timer_remaining().is_zero() {
+                    self.timer_deadline = None;
+                    self.timer_paused = None;
+                    self.timer_finished_at = Some(Instant::now());
+                    self.refresh_tick();
+                    let label = format_elapsed_short(self.timer_duration);
+                    return cosmic::task::future(async move {
+                        if let Err(err) = send_notification(
+                            "Timer finished".to_string(),
+                            format!("Your {label} timer is done."),
+                        )
+                        .await
+                        {
+                            tracing::error!(?err, "Failed to send timer notification");
+                        }
+                        cosmic::Action::None
+                    });
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1335,7 +1688,9 @@ impl cosmic::Application for Window {
             PanelAnchor::Top | PanelAnchor::Bottom
         );
 
-        let button = button::custom(if self.running_since.is_some() {
+        let button = button::custom(if self.timer_active() {
+            self.timer_panel(horizontal)
+        } else if self.running_since.is_some() {
             self.stopwatch_panel(horizontal)
         } else if horizontal {
             self.horizontal_layout()
@@ -1366,6 +1721,7 @@ impl cosmic::Application for Window {
             Page::Calendar => self.calendar_view(),
             Page::Settings => self.settings_view(),
             Page::Stopwatch => self.stopwatch_view(),
+            Page::Timer => self.timer_view(),
         };
         self.core.applet.popup_container(container(content)).into()
     }
