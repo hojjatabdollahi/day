@@ -29,6 +29,7 @@ use jiff::{
 use logind_zbus::manager::ManagerProxy;
 use std::hash::Hash;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use timedate_zbus::TimeDateProxy;
 use tokio::{sync::watch, time};
 
@@ -78,10 +79,13 @@ static FIRST_DAY_OPTIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
 
 const SETTINGS_SCROLL_HEIGHT: f32 = 380.0;
 
+const STOPWATCH_LAPS_HEIGHT: f32 = 180.0;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
     Calendar,
     Settings,
+    Stopwatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +144,42 @@ pub struct Window {
     page: Page,
     tabs: segmented_button::SingleSelectModel,
     city_combo_state: combo_box::State<CityEntry>,
+    // Stopwatch. Elapsed time is computed from a monotonic anchor, never
+    // accumulated from ticks, so it can't drift or jump on a clock change.
+    running_since: Option<Instant>,
+    accumulated: Duration,
+    laps: Vec<Duration>,
+    // Carries the desired repaint cadence to the stopwatch subscription:
+    // None parks it, Some(period) ticks at that period.
+    tick_tx: watch::Sender<Option<Duration>>,
+}
+
+/// Stopwatch readout with centiseconds, e.g. "01:23.45" or "1:02:03.45".
+fn format_elapsed(d: Duration) -> String {
+    let total_cs = d.as_millis() / 10;
+    let cs = total_cs % 100;
+    let total_secs = total_cs / 100;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}.{cs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}.{cs:02}")
+    }
+}
+
+/// Compact stopwatch readout for the panel, no centiseconds: "01:23" or "1:02:03".
+fn format_elapsed_short(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +209,12 @@ pub enum Message {
     RemoveClock(usize),
     // Calendar settings
     SetShowPersianCalendar(bool),
+    // Stopwatch
+    ToggleStopwatch,
+    StopwatchStartPause,
+    StopwatchReset,
+    StopwatchLap,
+    StopwatchTick,
 }
 
 impl Window {
@@ -329,6 +375,128 @@ impl Window {
             .to_string()
     }
 
+    fn stopwatch_elapsed(&self) -> Duration {
+        self.accumulated + self.running_since.map_or(Duration::ZERO, |t| t.elapsed())
+    }
+
+    /// Repaint cadence for the stopwatch subscription. Fast while the readout
+    /// is on screen, slow while only the panel needs it, off when stopped.
+    fn desired_tick(&self) -> Option<Duration> {
+        if self.running_since.is_none() {
+            None
+        } else if self.popup.is_some() && self.page == Page::Stopwatch {
+            Some(Duration::from_millis(100))
+        } else {
+            Some(Duration::from_secs(1))
+        }
+    }
+
+    fn refresh_tick(&self) {
+        let _ = self.tick_tx.send(self.desired_tick());
+    }
+
+    /// Compact running indicator shown on the panel in place of the clock.
+    fn stopwatch_panel(&self, horizontal: bool) -> Element<'_, Message> {
+        let label = self.core.applet.text(format_elapsed_short(self.stopwatch_elapsed()));
+        let glyph = icon::from_name("accessories-clock-symbolic")
+            .size(self.core.applet.suggested_size(true).0);
+        if horizontal {
+            Element::from(
+                row!(
+                    glyph,
+                    label,
+                    container(space::vertical().height(Length::Fixed(
+                        (self.core.applet.suggested_size(true).1
+                            + 2 * self.core.applet.suggested_padding(true).1)
+                            as f32
+                    )))
+                )
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+        } else {
+            Element::from(
+                column!(
+                    glyph,
+                    label,
+                    space::horizontal().width(Length::Fixed(
+                        (self.core.applet.suggested_size(true).0
+                            + 2 * self.core.applet.suggested_padding(true).1)
+                            as f32
+                    ))
+                )
+                .spacing(4)
+                .align_x(Alignment::Center),
+            )
+        }
+    }
+
+    fn stopwatch_view(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_xxs,
+            space_s,
+            space_m,
+            ..
+        } = theme::active().cosmic().spacing;
+
+        let running = self.running_since.is_some();
+        let elapsed = self.stopwatch_elapsed();
+
+        let header = row![
+            button::icon(icon::from_name("go-previous-symbolic"))
+                .padding(8)
+                .on_press(Message::ToggleStopwatch),
+            text::heading("Stopwatch"),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(space_s)
+        .padding([4, 8]);
+
+        let readout = container(text(format_elapsed(elapsed)).size(48))
+            .center_x(Length::Fill)
+            .padding([space_m, 0]);
+
+        let primary = button::suggested(if running { "Pause" } else { "Start" })
+            .on_press(Message::StopwatchStartPause);
+
+        let secondary = if running {
+            button::standard("Lap").on_press(Message::StopwatchLap)
+        } else {
+            let b = button::standard("Reset");
+            if elapsed > Duration::ZERO {
+                b.on_press(Message::StopwatchReset)
+            } else {
+                b
+            }
+        };
+
+        let controls = row![secondary, space::horizontal().width(Length::Fill), primary]
+            .spacing(space_s)
+            .padding([0, space_m]);
+
+        let mut content = column![header, readout, controls].spacing(space_s);
+
+        if !self.laps.is_empty() {
+            content = content
+                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+            let mut list = column![].spacing(space_xxs);
+            for (i, lap) in self.laps.iter().enumerate() {
+                list = list.push(
+                    row![
+                        text::body(format!("Lap {}", i + 1)).width(Length::Fill),
+                        text::body(format_elapsed(*lap)),
+                    ]
+                    .padding([4, space_m]),
+                );
+            }
+            content = content.push(
+                scrollable(list).height(Length::Fixed(STOPWATCH_LAPS_HEIGHT)),
+            );
+        }
+
+        content.padding([8, 0]).into()
+    }
+
     fn vertical_layout(&self) -> Element<'_, Message> {
         let mut elements: Vec<Element<'_, Message>> = Vec::new();
         let date = self.now.date();
@@ -470,6 +638,10 @@ impl Window {
         ]
         .spacing(8);
 
+        let stopwatch_btn = button::icon(icon::from_name("accessories-clock-symbolic"))
+            .padding(8)
+            .on_press(Message::ToggleStopwatch);
+
         let settings_btn = button::icon(icon::from_name("preferences-system-symbolic"))
             .padding(8)
             .on_press(Message::ToggleSettings);
@@ -484,6 +656,7 @@ impl Window {
             date_col,
             space::horizontal().width(Length::Fill),
             month_controls,
+            stopwatch_btn,
             settings_btn,
         ]
         .align_y(Alignment::Center)
@@ -709,6 +882,7 @@ impl cosmic::Application for Window {
         let today = now.date();
 
         let (show_seconds_tx, _) = watch::channel(false);
+        let (tick_tx, _) = watch::channel(None);
 
         (
             Self {
@@ -731,6 +905,10 @@ impl cosmic::Application for Window {
                     .insert(|b| b.text("Calendar").data(SettingsTab::Calendar))
                     .build(),
                 city_combo_state: combo_box::State::new(CITIES.clone()),
+                running_since: None,
+                accumulated: Duration::ZERO,
+                laps: Vec::new(),
+                tick_tx,
             },
             Task::none(),
         )
@@ -870,10 +1048,66 @@ impl cosmic::Application for Window {
             })
         }
 
+        fn stopwatch_subscription(tick: watch::Receiver<Option<Duration>>) -> Subscription<Message> {
+            struct Wrapper {
+                inner: watch::Receiver<Option<Duration>>,
+                id: &'static str,
+            }
+            impl Hash for Wrapper {
+                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+            Subscription::run_with(
+                Wrapper {
+                    inner: tick,
+                    id: "stopwatch-sub",
+                },
+                |Wrapper { inner, id: _ }| {
+                    let mut tick = inner.clone();
+                    stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
+                        let build = |period: Option<Duration>| {
+                            period.map(|p| {
+                                let mut t = time::interval(p);
+                                t.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                                t
+                            })
+                        };
+                        let mut timer = build(*tick.borrow_and_update());
+                        loop {
+                            match timer.as_mut() {
+                                // Running: tick at the carried cadence; rebuild on change.
+                                Some(t) => {
+                                    tokio::select! {
+                                        _ = t.tick() => {
+                                            let _ = output.send(Message::StopwatchTick).await;
+                                        }
+                                        Ok(()) = tick.changed() => {
+                                            timer = build(*tick.borrow_and_update());
+                                        }
+                                    }
+                                }
+                                // Stopped: park until a cadence arrives.
+                                None => {
+                                    if tick.changed().await.is_ok() {
+                                        timer = build(*tick.borrow_and_update());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+        }
+
         let show_seconds_rx = self.show_seconds_tx.subscribe();
+        let tick_rx = self.tick_tx.subscribe();
         Subscription::batch([
             rectangle_tracker_subscription(0).map(|e| Message::Rectangle(e.1)),
             time_subscription(show_seconds_rx),
+            stopwatch_subscription(tick_rx),
             activation_token_subscription(0).map(Message::Token),
             timezone_subscription(),
             wake_from_sleep_subscription(),
@@ -890,14 +1124,20 @@ impl cosmic::Application for Window {
         match message {
             Message::TogglePopup => {
                 if let Some(p) = self.popup.take() {
+                    self.refresh_tick();
                     destroy_popup(p)
                 } else {
                     self.date_today = self.now.date();
                     self.date_selected = self.date_today;
-                    self.page = Page::Calendar;
+                    self.page = if self.running_since.is_some() {
+                        Page::Stopwatch
+                    } else {
+                        Page::Calendar
+                    };
 
                     let new_id = window::Id::unique();
                     self.popup = Some(new_id);
+                    self.refresh_tick();
 
                     let mut popup_settings = self.core.applet.get_popup_settings(
                         self.core.main_window_id().unwrap(),
@@ -968,6 +1208,7 @@ impl cosmic::Application for Window {
                 } else {
                     Page::Settings
                 };
+                self.refresh_tick();
                 Task::none()
             }
             Message::Token(u) => {
@@ -1054,6 +1295,37 @@ impl cosmic::Application for Window {
                 self.save_config();
                 Task::none()
             }
+            Message::ToggleStopwatch => {
+                self.page = if self.page == Page::Stopwatch {
+                    Page::Calendar
+                } else {
+                    Page::Stopwatch
+                };
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchStartPause => {
+                match self.running_since.take() {
+                    // Was running: fold the current segment into the total.
+                    Some(start) => self.accumulated += start.elapsed(),
+                    // Was stopped: open a new segment.
+                    None => self.running_since = Some(Instant::now()),
+                }
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchReset => {
+                self.running_since = None;
+                self.accumulated = Duration::ZERO;
+                self.laps.clear();
+                self.refresh_tick();
+                Task::none()
+            }
+            Message::StopwatchLap => {
+                self.laps.push(self.stopwatch_elapsed());
+                Task::none()
+            }
+            Message::StopwatchTick => Task::none(),
         }
     }
 
@@ -1063,7 +1335,9 @@ impl cosmic::Application for Window {
             PanelAnchor::Top | PanelAnchor::Bottom
         );
 
-        let button = button::custom(if horizontal {
+        let button = button::custom(if self.running_since.is_some() {
+            self.stopwatch_panel(horizontal)
+        } else if horizontal {
             self.horizontal_layout()
         } else {
             self.vertical_layout()
@@ -1091,6 +1365,7 @@ impl cosmic::Application for Window {
         let content = match self.page {
             Page::Calendar => self.calendar_view(),
             Page::Settings => self.settings_view(),
+            Page::Stopwatch => self.stopwatch_view(),
         };
         self.core.applet.popup_container(container(content)).into()
     }
