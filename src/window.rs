@@ -10,6 +10,7 @@ use cosmic::{
     iced::{
         Alignment, Color, Length, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
+        mouse::ScrollDelta,
         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
         widget::{column, row, rule, scrollable},
         window,
@@ -17,7 +18,7 @@ use cosmic::{
     surface, theme,
     widget::{
         Button, Grid, Id, autosize, button, combo_box, container, divider, dropdown, grid, icon,
-        rectangle_tracker::*, segmented_button, space, tab_bar, text, toggler,
+        mouse_area, rectangle_tracker::*, segmented_button, space, tab_bar, text, toggler,
     },
 };
 use cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
@@ -156,6 +157,10 @@ pub struct Window {
     timer_deadline: Option<Instant>,     // Some while running
     timer_paused: Option<Duration>,      // remaining, Some while paused
     timer_finished_at: Option<Instant>,  // when it reached zero; drives the blink
+    // Press-and-hold on a stepper: the signed step being repeated, None when no
+    // arrow is held. Pushed to hold_tx to drive the accelerating repeat.
+    timer_hold: Option<i64>,
+    hold_tx: watch::Sender<Option<i64>>,
     // Carries the desired repaint cadence to the fast-tick subscription that
     // drives both the stopwatch and the timer: None parks it, Some(period) ticks.
     tick_tx: watch::Sender<Option<Duration>>,
@@ -253,6 +258,9 @@ pub enum Message {
     TimerStartPause,
     TimerReset,
     TimerAdd(i64),
+    TimerHoldStart(i64),
+    TimerHoldStop,
+    TimerHoldTick,
     // Shared repaint tick for the stopwatch and timer
     FastTick,
 }
@@ -447,6 +455,18 @@ impl Window {
         self.timer_deadline.is_some()
     }
 
+    /// Adjust the configured duration, clamped to [0, 99h]. Only meaningful
+    /// while idle, so it is a no-op once the timer is running, paused or done.
+    fn timer_add(&mut self, delta: i64) {
+        if self.timer_deadline.is_none()
+            && self.timer_paused.is_none()
+            && !self.timer_finished()
+        {
+            let secs = (self.timer_duration.as_secs() as i64 + delta).clamp(0, 99 * 3600);
+            self.timer_duration = Duration::from_secs(secs as u64);
+        }
+    }
+
     fn timer_finished(&self) -> bool {
         self.timer_finished_at.is_some()
     }
@@ -632,19 +652,37 @@ impl Window {
         let secs = total % 60;
 
         let unit = |label: &'static str, value: u64, step: i64| -> Element<'_, Message> {
-            column![
-                button::icon(icon::from_name("go-up-symbolic"))
+            // Press-and-hold starts an accelerating repeat (stopped by a global
+            // release listener); a single click yields exactly one step.
+            let col = column![
+                button::custom(icon::from_name("go-up-symbolic").size(16))
+                    .class(theme::Button::Icon)
                     .padding(4)
-                    .on_press(Message::TimerAdd(step)),
+                    .on_press_down(Message::TimerHoldStart(step)),
                 text(format!("{value:02}")).size(28),
                 text::caption(label),
-                button::icon(icon::from_name("go-down-symbolic"))
+                button::custom(icon::from_name("go-down-symbolic").size(16))
+                    .class(theme::Button::Icon)
                     .padding(4)
-                    .on_press(Message::TimerAdd(-step)),
+                    .on_press_down(Message::TimerHoldStart(-step)),
             ]
             .align_x(Alignment::Center)
-            .spacing(4)
-            .into()
+            .spacing(4);
+            // Scrolling over the column nudges the value one step per notch.
+            mouse_area(col)
+                .on_scroll(move |delta| {
+                    let y = match delta {
+                        ScrollDelta::Lines { y, .. } | ScrollDelta::Pixels { y, .. } => y,
+                    };
+                    Message::TimerAdd(if y > 0.0 {
+                        step
+                    } else if y < 0.0 {
+                        -step
+                    } else {
+                        0
+                    })
+                })
+                .into()
         };
 
         row![
@@ -1156,6 +1194,7 @@ impl cosmic::Application for Window {
 
         let (show_seconds_tx, _) = watch::channel(false);
         let (tick_tx, _) = watch::channel(None);
+        let (hold_tx, _) = watch::channel(None);
 
         (
             Self {
@@ -1185,6 +1224,8 @@ impl cosmic::Application for Window {
                 timer_deadline: None,
                 timer_paused: None,
                 timer_finished_at: None,
+                timer_hold: None,
+                hold_tx,
                 tick_tx,
             },
             Task::none(),
@@ -1381,12 +1422,91 @@ impl cosmic::Application for Window {
             )
         }
 
+        // Repeats a held stepper at an accelerating rate while hold_tx carries a
+        // delta. The held delta lives on the model; this only paces TimerHoldTick.
+        fn hold_repeat_subscription(
+            hold: watch::Receiver<Option<i64>>,
+        ) -> Subscription<Message> {
+            struct Wrapper {
+                inner: watch::Receiver<Option<i64>>,
+                id: &'static str,
+            }
+            impl Hash for Wrapper {
+                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                    self.id.hash(state);
+                }
+            }
+            // Initial pause, then accelerate to a 45ms floor.
+            fn hold_delay(count: u32) -> Duration {
+                let ms = 360u64.saturating_sub(count as u64 * 35).max(45);
+                Duration::from_millis(ms)
+            }
+            Subscription::run_with(
+                Wrapper {
+                    inner: hold,
+                    id: "timer-hold-sub",
+                },
+                |Wrapper { inner, id: _ }| {
+                    let mut hold = inner.clone();
+                    stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
+                        loop {
+                            // Park until an arrow is held.
+                            if hold.borrow_and_update().is_none() {
+                                if hold.changed().await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Held: repeat faster the longer it lasts. Any change
+                            // (release or a new press) restarts the acceleration.
+                            let mut count: u32 = 1;
+                            loop {
+                                tokio::select! {
+                                    _ = time::sleep(hold_delay(count)) => {
+                                        if output.send(Message::TimerHoldTick).await.is_err() {
+                                            return;
+                                        }
+                                        count += 1;
+                                    }
+                                    res = hold.changed() => {
+                                        if res.is_err() {
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+        }
+
+        // Stops a held stepper on the next left-button (or touch) release anywhere
+        // — mouse_area only reports releases over its own bounds, which would miss
+        // a release after the cursor drifts off the arrow.
+        fn release_listener(
+            event: cosmic::iced::Event,
+            _status: cosmic::iced::event::Status,
+            _id: window::Id,
+        ) -> Option<Message> {
+            use cosmic::iced::{Event, mouse, touch};
+            match event {
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerLifted { .. })
+                | Event::Touch(touch::Event::FingerLost { .. }) => Some(Message::TimerHoldStop),
+                _ => None,
+            }
+        }
+
         let show_seconds_rx = self.show_seconds_tx.subscribe();
         let tick_rx = self.tick_tx.subscribe();
-        Subscription::batch([
+        let hold_rx = self.hold_tx.subscribe();
+        let mut subscriptions = vec![
             rectangle_tracker_subscription(0).map(|e| Message::Rectangle(e.1)),
             time_subscription(show_seconds_rx),
             fast_tick_subscription(tick_rx),
+            hold_repeat_subscription(hold_rx),
             activation_token_subscription(0).map(Message::Token),
             timezone_subscription(),
             wake_from_sleep_subscription(),
@@ -1396,7 +1516,11 @@ impl cosmic::Application for Window {
                 }
                 Message::ConfigChanged(u.config)
             }),
-        ])
+        ];
+        if self.timer_hold.is_some() {
+            subscriptions.push(cosmic::iced::event::listen_with(release_listener));
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
@@ -1647,13 +1771,24 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::TimerAdd(delta) => {
-                // Editing the duration is only meaningful while idle.
-                if self.timer_deadline.is_none()
-                    && self.timer_paused.is_none()
-                    && !self.timer_finished()
-                {
-                    let secs = (self.timer_duration.as_secs() as i64 + delta).clamp(0, 99 * 3600);
-                    self.timer_duration = Duration::from_secs(secs as u64);
+                self.timer_add(delta);
+                Task::none()
+            }
+            Message::TimerHoldStart(delta) => {
+                // One immediate step, then the repeat subscription accelerates.
+                self.timer_add(delta);
+                self.timer_hold = Some(delta);
+                let _ = self.hold_tx.send(Some(delta));
+                Task::none()
+            }
+            Message::TimerHoldStop => {
+                self.timer_hold = None;
+                let _ = self.hold_tx.send(None);
+                Task::none()
+            }
+            Message::TimerHoldTick => {
+                if let Some(delta) = self.timer_hold {
+                    self.timer_add(delta);
                 }
                 Task::none()
             }
