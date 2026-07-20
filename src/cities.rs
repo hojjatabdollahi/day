@@ -42,6 +42,13 @@ pub static CITIES: LazyLock<Vec<CityEntry>> = LazyLock::new(|| {
         })
         .collect();
 
+    // UTC has no "city" in the tzdb data, so add it manually as a searchable entry.
+    cities.push(CityEntry {
+        city: "UTC".to_string(),
+        timezone: "UTC".to_string(),
+        country: "Coordinated Universal Time".to_string(),
+    });
+
     cities.sort_by(|a, b| a.city.cmp(&b.city));
     cities
 });
