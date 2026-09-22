@@ -48,9 +48,6 @@
     <clipPath id="frame">
       <rect x="77" y="79" width="1100" height="1100" rx="262"/>
     </clipPath>
-    <filter id="lift" x="-8%" y="-8%" width="120%" height="120%">
-      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#012858" flood-opacity=".25"/>
-    </filter>
   </defs>
 
   <g clip-path="url(#frame)">
@@ -62,7 +59,7 @@
     <circle cx="1055" cy="180" r="460" fill="url(#glow)"/>
     <circle cx="1055" cy="180" r="118" fill="url(#sun)"/>
 
-    <g filter="url(#lift)">
+    <g>
       <path fill="url(#paper)" fill-rule="evenodd" d="M358 327h442c35 0 219 83 219 333s-184 336-219 336H358a100 100 0 0 1-100-100V427a100 100 0 0 1 100-100ZM700 493h90a230 230 0 0 1-12 447c-58 10-128 10-184 2C650 905 690 875 700 820ZM375 327v52a49.5 49.5 0 0 0 99 0v-52Zm309 0v52a49.5 49.5 0 0 0 99 0v-52Z"/>
         <rect x="387" y="241" width="75" height="168" rx="37.5" fill="#fdfeff"/>
       <rect x="696" y="241" width="75" height="168" rx="37.5" fill="#fdfeff"/>
