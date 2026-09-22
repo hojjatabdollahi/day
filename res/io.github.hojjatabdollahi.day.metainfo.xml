@@ -4,6 +4,7 @@
   <name>Day</name>
   <summary>Clock, calendar, world clocks, stopwatch and timer for COSMIC</summary>
   <launchable type="desktop-id">io.github.hojjatabdollahi.day.desktop</launchable>
+  <developer_name>Hojjat</developer_name>
   <developer id="io.github.hojjatabdollahi">
     <name>Hojjat</name>
   </developer>
