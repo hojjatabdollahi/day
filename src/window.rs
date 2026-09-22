@@ -1794,21 +1794,24 @@ fn date_button(
     };
 
     let content: Element<'static, Message> = if let Some(pd) = persian_day {
-        let gregorian_center = text(format!("{day}"))
-            .size(16)
-            .apply(container)
-            .center(Length::Fill);
-        let farsi_bottom = text(to_farsi_digits(pd))
-            .size(10)
-            .apply(container)
-            .align_x(Alignment::Center)
-            .width(Length::Fill)
-            .padding([0, 0, 2, 0]);
-        column![gregorian_center, farsi_bottom].into()
+        column![
+            text(format!("{day}"))
+                .size(16)
+                .center()
+                .width(Length::Fill)
+                .height(Length::Fill),
+            text(to_farsi_digits(pd))
+                .size(10)
+                .align_x(Alignment::Center)
+                .width(Length::Fill),
+        ]
+        .padding([0, 0, 2, 0])
+        .into()
     } else {
         text::body(format!("{day}"))
-            .apply(container)
-            .center(Length::Fill)
+            .center()
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     };
 
