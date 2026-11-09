@@ -56,3 +56,7 @@ just flatpak-uninstall
 ## Why "Day"?
 
 Day (دی) is the 10th month of the Persian calendar. Also, it's every day of the Gregorian calendar!
+
+## Credits
+
+The optional seven-segment clock uses the [DSEG](https://github.com/keshikan/DSEG) font by keshikan, licensed under the SIL Open Font License 1.1.

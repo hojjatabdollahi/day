@@ -8,7 +8,7 @@ use cosmic::{
     iced::stream,
     iced::widget::Column,
     iced::{
-        Alignment, Color, Length, Rectangle, Subscription,
+        Alignment, Color, Font, Length, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
         mouse::ScrollDelta,
         platform_specific::shell::wayland::commands::popup::destroy_popup,
@@ -56,6 +56,23 @@ use icu::{
 };
 
 const APPLET_ID: &str = "io.github.hojjatabdollahi.day";
+
+const SEVEN_SEGMENT_FONT_BYTES: &[u8] = include_bytes!("../res/fonts/DSEG7Classic-Regular.ttf");
+const SEVEN_SEGMENT_FONT: Font = Font::with_name("DSEG7 Classic");
+
+fn load_seven_segment_font() {
+    cosmic::iced::advanced::graphics::text::font_system()
+        .write()
+        .expect("font system lock")
+        .load_font(std::borrow::Cow::Borrowed(SEVEN_SEGMENT_FONT_BYTES));
+}
+
+fn split_day_period(s: &str) -> (&str, &str) {
+    let end = s
+        .rfind(|c: char| c.is_ascii_digit())
+        .map_or(s.len(), |i| i + 1);
+    (&s[..end], s[end..].trim_start())
+}
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 
@@ -315,6 +332,7 @@ pub enum Message {
     // General settings
     SetMilitaryTime(bool),
     SetShowSeconds(bool),
+    SetSevenSegment(bool),
     SetShowDate(bool),
     SetShowWeekday(bool),
     SetFirstDayOfWeek(usize),
@@ -492,6 +510,32 @@ impl Window {
         }
     }
 
+    /// A digits readout. With the seven-segment clock enabled it uses the DSEG
+    /// font over a dim "88:88" layer standing in for the unlit segments.
+    fn readout<'a>(
+        &'a self,
+        s: String,
+        make: impl Fn(String) -> cosmic::widget::Text<'a, cosmic::Theme>,
+    ) -> Element<'a, Message> {
+        if !self.config.seven_segment {
+            return make(s).into();
+        }
+        let ghost: String = s
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '8' } else { c })
+            .collect();
+        let mut dim = Color::from(theme::active().cosmic().on_bg_color());
+        dim.a = 0.15;
+        cosmic::iced::widget::stack([
+            make(ghost)
+                .font(SEVEN_SEGMENT_FONT)
+                .class(theme::Text::Color(dim))
+                .into(),
+            make(s).font(SEVEN_SEGMENT_FONT).into(),
+        ])
+        .into()
+    }
+
     /// Icon plus readout shown on the panel while the stopwatch or timer runs.
     fn panel_indicator(
         &self,
@@ -502,7 +546,7 @@ impl Window {
     ) -> Element<'_, Message> {
         let (width, height) = self.core.applet.suggested_size(true);
         let padding = 2 * self.core.applet.suggested_padding(true).1;
-        let label = self.core.applet.text(readout).class(class);
+        let label = self.readout(readout, |s| self.core.applet.text(s).class(class));
         let glyph = icon::from_name(icon_name).size(width);
         if horizontal {
             row!(
@@ -547,11 +591,9 @@ impl Window {
         let finished = self.timer_finished();
         let remaining = self.timer_remaining();
 
-        let readout = container(
-            text(format_elapsed_short(remaining))
-                .size(48)
-                .class(self.timer_text_class()),
-        )
+        let readout = container(self.readout(format_elapsed_short(remaining), |s| {
+            text(s).size(48).class(self.timer_text_class())
+        }))
         .center_x(Length::Fill)
         .padding([space_m, 0]);
 
@@ -684,7 +726,7 @@ impl Window {
         .spacing(space_s)
         .padding([4, 8]);
 
-        let readout = container(text(format_elapsed(elapsed)).size(48))
+        let readout = container(self.readout(format_elapsed(elapsed), |s| text(s).size(48)))
             .center_x(Length::Fill)
             .padding([space_m, 0]);
 
@@ -762,7 +804,11 @@ impl Window {
             .to_string();
 
         for p in formatted_time.split_whitespace().flat_map(|s| s.split(':')) {
-            elements.push(self.core.applet.text(p.to_owned()).into());
+            elements.push(if p.chars().all(|c| c.is_ascii_digit()) {
+                self.readout(p.to_owned(), |s| self.core.applet.text(s))
+            } else {
+                self.core.applet.text(p.to_owned()).into()
+            });
         }
 
         let date_time_col = Column::with_children(elements)
@@ -790,6 +836,49 @@ impl Window {
         } else {
             HourCycle::H12
         });
+
+        if self.config.seven_segment {
+            let mut fs = fieldsets::T::medium();
+            if !self.config.show_seconds {
+                fs = fs.with_time_precision(TimePrecision::Minute);
+            }
+            let time = DateTimeFormatter::try_new(prefs, fs)
+                .unwrap()
+                .format(&datetime)
+                .to_string();
+            let (digits, day_period) = split_day_period(&time);
+            let mut parts: Vec<Element<'_, Message>> = Vec::new();
+            if self.config.show_date_in_top_panel {
+                let date = if self.config.show_weekday {
+                    DateTimeFormatter::try_new(prefs, fieldsets::MDE::medium())
+                        .unwrap()
+                        .format(&datetime)
+                        .to_string()
+                } else {
+                    DateTimeFormatter::try_new(prefs, fieldsets::MD::medium())
+                        .unwrap()
+                        .format(&datetime)
+                        .to_string()
+                };
+                parts.push(self.core.applet.text(date).into());
+            }
+            parts.push(self.readout(digits.to_owned(), |s| self.core.applet.text(s)));
+            if !day_period.is_empty() {
+                parts.push(self.core.applet.text(day_period.to_owned()).into());
+            }
+            parts.push(
+                container(space::vertical().height(Length::Fixed(
+                    (self.core.applet.suggested_size(true).1
+                        + 2 * self.core.applet.suggested_padding(true).1)
+                        as f32,
+                )))
+                .into(),
+            );
+            return cosmic::iced::widget::Row::with_children(parts)
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into();
+        }
 
         let formatted_date = if self.config.show_date_in_top_panel {
             if self.config.show_weekday {
@@ -1005,6 +1094,11 @@ impl Window {
             divider(),
             toggle_row("24-hour time", c.military_time, Message::SetMilitaryTime),
             toggle_row("Show seconds", c.show_seconds, Message::SetShowSeconds),
+            toggle_row(
+                "Seven-segment clock",
+                c.seven_segment,
+                Message::SetSevenSegment
+            ),
             divider(),
             padded_control(
                 column![
@@ -1110,6 +1204,7 @@ impl cosmic::Application for Window {
     const APP_ID: &str = APPLET_ID;
 
     fn init(core: app::Core, _flags: Self::Flags) -> (Self, app::Task<Self::Message>) {
+        load_seven_segment_font();
         let locale = get_system_locale();
         let now = Zoned::now();
         let today = now.date();
@@ -1556,6 +1651,11 @@ impl cosmic::Application for Window {
                 self.save_config();
                 Task::none()
             }
+            Message::SetSevenSegment(v) => {
+                self.config.seven_segment = v;
+                self.save_config();
+                Task::none()
+            }
             Message::SetShowDate(v) => {
                 self.config.show_date_in_top_panel = v;
                 self.save_config();
@@ -1842,6 +1942,19 @@ mod tests {
         assert_eq!(clock_display_name("UTC"), "UTC");
         assert_eq!(format_offset(34_200), "+9:30");
         assert_eq!(format_offset(-25_200), "-7");
+        assert_eq!(split_day_period("9:01\u{202f}PM"), ("9:01", "PM"));
+        assert_eq!(split_day_period("21:01:05"), ("21:01:05", ""));
+    }
+
+    #[test]
+    fn seven_segment_font_resolves() {
+        use cosmic::iced::advanced::graphics::text::{cosmic_text::fontdb, font_system};
+        load_seven_segment_font();
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name("DSEG7 Classic")],
+            ..Default::default()
+        };
+        assert!(font_system().read().unwrap().db().query(&query).is_some());
     }
 
     #[test]
