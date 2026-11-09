@@ -22,12 +22,12 @@ use cosmic::{
     },
 };
 use cosmic_config::{Config as CosmicConfig, CosmicConfigEntry};
+use cosmic_login1_zbus::manager::ManagerProxy;
 use jiff::{
     Timestamp, ToSpan, Zoned,
     civil::{Date, Weekday},
     tz::TimeZone,
 };
-use cosmic_login1_zbus::manager::ManagerProxy;
 use std::hash::Hash;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -45,9 +45,14 @@ use cosmic::applet::token::subscription::{
 use icu::{
     calendar::{Gregorian, cal::Persian},
     datetime::{
-        DateTimeFormatter, DateTimeFormatterPreferences, fieldsets,
+        DateTimeFormatter, DateTimeFormatterPreferences,
+        fieldsets::{
+            self,
+            builder::{DateFields, FieldSetBuilder},
+            enums::CompositeDateTimeFieldSet,
+        },
         input::{Date as IcuDate, DateTime, Time},
-        options::TimePrecision,
+        options::{Length as IcuLength, TimePrecision},
     },
     locale::{
         Locale, locale,
@@ -208,19 +213,40 @@ fn opaque<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> 
     cosmic::iced::widget::Themer::new(Some(theme), content).into()
 }
 
+/// A labelled toggler; `None` renders it disabled.
 fn toggle_row(
     label: &'static str,
     on: bool,
-    msg: fn(bool) -> Message,
+    msg: Option<fn(bool) -> Message>,
 ) -> Element<'static, Message> {
     padded_control(
         row![
             text::body(label).width(Length::Fill),
-            toggler(on).on_toggle(msg),
+            toggler(on).on_toggle_maybe(msg),
         ]
         .align_y(Alignment::Center),
     )
     .into()
+}
+
+/// Panel date: month and day, plus year and/or weekday when toggled on. `time`
+/// folds the clock into the same locale pattern at that precision.
+fn panel_date_fieldset(
+    year: bool,
+    weekday: bool,
+    time: Option<TimePrecision>,
+) -> CompositeDateTimeFieldSet {
+    let date_fields = match (year, weekday) {
+        (false, false) => DateFields::MD,
+        (false, true) => DateFields::MDE,
+        (true, false) => DateFields::YMD,
+        (true, true) => DateFields::YMDE,
+    };
+    let mut builder = FieldSetBuilder::default();
+    builder.length = Some(IcuLength::Medium);
+    builder.date_fields = Some(date_fields);
+    builder.time_precision = time;
+    builder.build_composite_datetime().unwrap()
 }
 
 /// Subscription key for a `watch` receiver. Hashes only the id, so the stream
@@ -335,6 +361,7 @@ pub enum Message {
     SetSevenSegment(bool),
     SetShowDate(bool),
     SetShowWeekday(bool),
+    SetShowYear(bool),
     SetFirstDayOfWeek(usize),
     // Tab navigation
     TabActivated(segmented_button::Entity),
@@ -780,10 +807,13 @@ impl Window {
         });
 
         if self.config.show_date_in_top_panel {
-            let formatted_date = DateTimeFormatter::try_new(prefs, fieldsets::MD::medium())
-                .unwrap()
-                .format(&datetime)
-                .to_string();
+            let formatted_date = DateTimeFormatter::try_new(
+                prefs,
+                panel_date_fieldset(self.config.show_year, false, None),
+            )
+            .unwrap()
+            .format(&datetime)
+            .to_string();
 
             for p in formatted_date.split_whitespace() {
                 elements.push(self.core.applet.text(p.to_owned()).into());
@@ -849,17 +879,13 @@ impl Window {
             let (digits, day_period) = split_day_period(&time);
             let mut parts: Vec<Element<'_, Message>> = Vec::new();
             if self.config.show_date_in_top_panel {
-                let date = if self.config.show_weekday {
-                    DateTimeFormatter::try_new(prefs, fieldsets::MDE::medium())
-                        .unwrap()
-                        .format(&datetime)
-                        .to_string()
-                } else {
-                    DateTimeFormatter::try_new(prefs, fieldsets::MD::medium())
-                        .unwrap()
-                        .format(&datetime)
-                        .to_string()
-                };
+                let date = DateTimeFormatter::try_new(
+                    prefs,
+                    panel_date_fieldset(self.config.show_year, self.config.show_weekday, None),
+                )
+                .unwrap()
+                .format(&datetime)
+                .to_string();
                 parts.push(self.core.applet.text(date).into());
             }
             parts.push(self.readout(digits.to_owned(), |s| self.core.applet.text(s)));
@@ -881,25 +907,22 @@ impl Window {
         }
 
         let formatted_date = if self.config.show_date_in_top_panel {
-            if self.config.show_weekday {
-                let mut fs = fieldsets::MDET::medium();
-                if !self.config.show_seconds {
-                    fs = fs.with_time_precision(TimePrecision::Minute);
-                }
-                DateTimeFormatter::try_new(prefs, fs)
-                    .unwrap()
-                    .format(&datetime)
-                    .to_string()
+            let precision = if self.config.show_seconds {
+                TimePrecision::Second
             } else {
-                let mut fs = fieldsets::MDT::medium();
-                if !self.config.show_seconds {
-                    fs = fs.with_time_precision(TimePrecision::Minute);
-                }
-                DateTimeFormatter::try_new(prefs, fs)
-                    .unwrap()
-                    .format(&datetime)
-                    .to_string()
-            }
+                TimePrecision::Minute
+            };
+            DateTimeFormatter::try_new(
+                prefs,
+                panel_date_fieldset(
+                    self.config.show_year,
+                    self.config.show_weekday,
+                    Some(precision),
+                ),
+            )
+            .unwrap()
+            .format(&datetime)
+            .to_string()
         } else {
             let mut fs = fieldsets::T::medium();
             if !self.config.show_seconds {
@@ -1088,16 +1111,33 @@ impl Window {
             toggle_row(
                 "Show date in panel",
                 c.show_date_in_top_panel,
-                Message::SetShowDate
+                Some(Message::SetShowDate)
             ),
-            toggle_row("Show weekday", c.show_weekday, Message::SetShowWeekday),
+            toggle_row(
+                "Show weekday",
+                c.show_weekday,
+                Some(Message::SetShowWeekday)
+            ),
+            toggle_row(
+                "Show year",
+                c.show_year,
+                c.show_date_in_top_panel.then_some(Message::SetShowYear)
+            ),
             divider(),
-            toggle_row("24-hour time", c.military_time, Message::SetMilitaryTime),
-            toggle_row("Show seconds", c.show_seconds, Message::SetShowSeconds),
+            toggle_row(
+                "24-hour time",
+                c.military_time,
+                Some(Message::SetMilitaryTime)
+            ),
+            toggle_row(
+                "Show seconds",
+                c.show_seconds,
+                Some(Message::SetShowSeconds)
+            ),
             toggle_row(
                 "Seven-segment clock",
                 c.seven_segment,
-                Message::SetSevenSegment
+                Some(Message::SetSevenSegment)
             ),
             divider(),
             padded_control(
@@ -1666,6 +1706,11 @@ impl cosmic::Application for Window {
                 self.save_config();
                 Task::none()
             }
+            Message::SetShowYear(v) => {
+                self.config.show_year = v;
+                self.save_config();
+                Task::none()
+            }
             Message::SetFirstDayOfWeek(i) => {
                 self.config.first_day_of_week = i as u8;
                 self.save_config();
@@ -1965,5 +2010,20 @@ mod tests {
         let prefs = DateTimeFormatterPreferences::from(locale!("en-US"));
         let weekday = DateTimeFormatter::try_new(prefs, fieldsets::E::short()).unwrap();
         assert_eq!(weekday.format(&icu_date(date)).to_string(), "Thu");
+
+        let dt = DateTime {
+            date: icu_date(date),
+            time: Time::start_of_day(),
+        };
+        let panel = |year, weekday, time| {
+            DateTimeFormatter::try_new(prefs, panel_date_fieldset(year, weekday, time))
+                .unwrap()
+                .format(&dt)
+                .to_string()
+        };
+        assert_eq!(panel(false, false, None), "Sep 17");
+        assert_eq!(panel(true, true, None), "Thu, Sep 17, 2026");
+        let with_time = panel(true, false, Some(TimePrecision::Minute));
+        assert!(with_time.starts_with("Sep 17, 2026, 12:00"), "{with_time}");
     }
 }
