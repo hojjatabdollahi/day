@@ -1239,7 +1239,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "day"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cosmic-config",
  "cosmic-login1-zbus",
