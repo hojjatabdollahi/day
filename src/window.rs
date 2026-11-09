@@ -27,11 +27,11 @@ use jiff::{
     civil::{Date, Weekday},
     tz::TimeZone,
 };
-use logind_zbus::manager::ManagerProxy;
+use cosmic_login1_zbus::manager::ManagerProxy;
 use std::hash::Hash;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use timedate_zbus::TimeDateProxy;
+use timedate1_zbus::TimeDateProxy;
 use tokio::{sync::watch, time};
 
 use crate::{
@@ -293,7 +293,7 @@ fn format_elapsed_short(d: Duration) -> String {
 async fn send_notification(summary: String, body: String) -> zbus::Result<()> {
     let conn = zbus::Connection::session().await?;
     let actions: Vec<&str> = Vec::new();
-    let hints: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> =
+    let hints: std::collections::HashMap<&str, zbus::Variant<'_>> =
         std::collections::HashMap::new();
     conn.call_method(
         Some("org.freedesktop.Notifications"),
