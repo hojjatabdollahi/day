@@ -1264,7 +1264,10 @@ impl cosmic::Application for Window {
                 rectangle_tracker: None,
                 rectangle: Rectangle::default(),
                 token_tx: None,
-                config: TimeAppletConfig::default(),
+                // Read from disk now: the dbus config watcher may deliver late (or never) after a panel restart.
+                config: CosmicConfig::new(APPLET_ID, TimeAppletConfig::VERSION)
+                    .map(|h| TimeAppletConfig::get_entry(&h).unwrap_or_else(|(_, c)| c))
+                    .unwrap_or_default(),
                 show_seconds_tx,
                 locale,
                 page: Page::Calendar,
